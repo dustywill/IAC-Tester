@@ -1,148 +1,9 @@
-/*
- * IAC Valve Tester for 1997 Jeep Wrangler 2.5L
- * 
- * Controls a bipolar stepper motor (IAC valve) via TB6612FNG driver
- * Monitors PCM signals via PC817 optocoupler isolation
- * Provides web interface for control and logging
- * 
- * Hardware:
- *   - ESP32 DevKitC (or similar)
- *   - TB6612FNG Dual Motor Driver
- *   - PC817 8-Channel Optocoupler Board
- *   - LM2596 Buck Converter (12V -> 5V)
- * 
- * Author: Byron
- * Date: 2025
- */
-
-#include <WiFi.h>
-#include <WebServer.h>
-#include <ArduinoJson.h>
-
-// ============================================
-// CONFIGURATION - Update these for your setup
-// ============================================
-
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-
-// Set to true to create an Access Point instead of connecting to WiFi
-const bool AP_MODE = true;
-const char* AP_SSID = "IAC_Tester";
-const char* AP_PASSWORD = "jeep1997";
-
-// ============================================
-// PIN DEFINITIONS - ESP32-S3-WROOM-1
-// ============================================
-// Note: Avoid GPIO0 (strapping), GPIO19-20 (USB), GPIO26-37 (flash/PSRAM)
-
-// TB6612FNG Motor Driver Pins (directly controlling IAC stepper)
-const int PIN_AIN1 = 5;   // Coil A control 1
-const int PIN_AIN2 = 6;   // Coil A control 2
-const int PIN_BIN1 = 7;   // Coil B control 1
-const int PIN_BIN2 = 15;  // Coil B control 2
-const int PIN_STBY = 16;  // Standby (HIGH = enabled)
-
-// PC817 Optocoupler Inputs (monitoring PCM signals)
-// Note: Optocoupler inverts signal - HIGH on PCM = LOW on ESP32
-const int PIN_PCM_A1 = 17;  // PCM Coil A pin 1 monitor
-const int PIN_PCM_A2 = 18;  // PCM Coil A pin 2 monitor
-const int PIN_PCM_B1 = 8;   // PCM Coil B pin 1 monitor
-const int PIN_PCM_B2 = 3;   // PCM Coil B pin 2 monitor
-
-// ============================================
-// STEPPER MOTOR CONFIGURATION
-// ============================================
-
-// Full step sequence for bipolar stepper (4 steps per cycle)
-// Each row: {AIN1, AIN2, BIN1, BIN2}
-const int STEP_SEQUENCE[4][4] = {
-  {HIGH, LOW,  HIGH, LOW },  // Step 0
-  {LOW,  HIGH, HIGH, LOW },  // Step 1
-  {LOW,  HIGH, LOW,  HIGH},  // Step 2
-  {HIGH, LOW,  LOW,  HIGH}   // Step 3
-};
-
-// Current step position (0-3)
-volatile int currentStep = 0;
-
-// Stepper settings (adjustable via web interface)
-volatile int stepDelayMs = 20;        // Delay between steps (ms)
-volatile int targetSteps = 0;         // Steps remaining to move
-volatile int stepDirection = 1;       // 1 = extend, -1 = retract
-volatile bool motorEnabled = false;   // Motor driver enabled state
-volatile bool isMoving = false;       // Currently executing movement
-
-// ============================================
-// PCM SIGNAL LOGGING
-// ============================================
-
-struct SignalLog {
-  unsigned long timestamp;
-  uint8_t pcmA1 : 1;
-  uint8_t pcmA2 : 1;
-  uint8_t pcmB1 : 1;
-  uint8_t pcmB2 : 1;
-  uint8_t iacActive : 1;  // Was IAC button pressed at this time?
-};
-
-const int LOG_BUFFER_SIZE = 500;  // Store last 500 signal changes
-SignalLog signalLog[LOG_BUFFER_SIZE];
-volatile int logIndex = 0;
-volatile int logCount = 0;
-
-// Previous PCM state for change detection
-volatile uint8_t prevPcmState = 0;
-
-// PCM direction detection
-volatile int pcmStepIndex = -1;      // Current detected step (0-3), -1 = unknown
-volatile int prevPcmStepIndex = -1;  // Previous step for direction calc
-volatile int pcmDirection = 0;       // 1 = extend, -1 = retract, 0 = idle/unknown
-volatile unsigned long lastPcmChange = 0;  // For idle detection
-const unsigned long PCM_IDLE_TIMEOUT = 500; // ms without change = idle
-
-// Cumulative step position tracking
-volatile long youStepPosition = 0;   // Your commanded steps (cumulative)
-volatile long pcmStepPosition = 0;   // PCM detected steps (cumulative)
-
-// Step pattern lookup: maps {A1,A2,B1,B2} bit pattern to step index
-// Pattern: A1 + (A2<<1) + (B1<<2) + (B2<<3)
-const int8_t STEP_LOOKUP[16] = {
-  -1,  // 0000 - invalid
-  -1,  // 0001 - invalid
-  -1,  // 0010 - invalid
-  -1,  // 0011 - invalid
-  -1,  // 0100 - invalid
-   0,  // 0101 - Step 0: A1=1, A2=0, B1=1, B2=0
-   1,  // 0110 - Step 1: A1=0, A2=1, B1=1, B2=0
-  -1,  // 0111 - invalid
-  -1,  // 1000 - invalid
-   3,  // 1001 - Step 3: A1=1, A2=0, B1=0, B2=1
-   2,  // 1010 - Step 2: A1=0, A2=1, B1=0, B2=1
-  -1,  // 1011 - invalid
-  -1,  // 1100 - invalid
-  -1,  // 1101 - invalid
-  -1,  // 1110 - invalid
-  -1   // 1111 - invalid
-};
-
-// ============================================
-// WEB SERVER
-// ============================================
-
-WebServer server(80);
-
-// ============================================
-// HTML/JS/CSS - Embedded Web Interface
-// ============================================
-
-const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>IAC Valve Tester</title>
+  <title>IAC Valve Tester - PREVIEW</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     :root {
@@ -171,6 +32,16 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       color: var(--text-primary);
       min-height: 100vh;
       padding: 20px;
+    }
+    
+    .preview-banner {
+      background: var(--accent-orange);
+      color: var(--bg-primary);
+      text-align: center;
+      padding: 10px;
+      font-weight: bold;
+      margin-bottom: 20px;
+      border-radius: 4px;
     }
     
     .container {
@@ -571,6 +442,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </head>
 <body>
   <div class="container">
+    <div class="preview-banner">
+      ⚠ PREVIEW MODE - Mock data, no ESP32 connection ⚠
+    </div>
+    
     <header>
       <h1>IAC Valve Tester</h1>
       <div class="subtitle">1997 Jeep Wrangler 2.5L</div>
@@ -691,46 +566,54 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div class="panel">
       <div class="panel-title">Signal Log</div>
       <div class="log-container" id="logContainer">
-        <div class="log-entry">
-          <span class="time">--:--:--</span>
-          <span class="signals">----</span>
-          <span class="event">Waiting for signals...</span>
-        </div>
+        <!-- Mock log entries will be added here -->
       </div>
       <div class="log-controls">
         <button class="btn" onclick="clearLog()">Clear Log</button>
         <button class="btn" onclick="downloadLog()">Download CSV</button>
         <button class="btn" id="btnPauseLog" onclick="toggleLogPause()">Pause</button>
         <button class="btn" onclick="resetAll()" style="border-left: 4px solid var(--accent-green);">Reset Chart</button>
+        <button class="btn" onclick="simulateSignals()" style="border-left: 4px solid #3b82f6;">Simulate PCM</button>
       </div>
     </div>
   </div>
   
   <script>
-    // State
+    // =============================================
+    // PREVIEW MODE - Simulated behavior for testing
+    // =============================================
+    
     let isLogPaused = false;
     let logData = [];
-    let pollInterval = null;
-    let iacButtonActive = false;
-    let currentYouDirection = 0;  // Track what you're commanding
+    let simulationInterval = null;
+    let isMoving = false;
+    let moveDirection = 0;
+    
+    // Mock PCM state
+    let pcmState = { a1: false, a2: false, b1: false, b2: false };
+    let stepIndex = 0;
+    let pcmDirection = 0;  // Simulated PCM direction
     
     // Step position tracking for chart
     let youStepPosition = 0;
     let pcmStepPosition = 0;
-    let chartData = {
-      labels: [],
-      youData: [],
-      pcmData: []
-    };
     let stepChart = null;
     const MAX_CHART_POINTS = 200;
     let chartStartTime = Date.now();
     
-    // Initialize
+    // Step sequence for simulation
+    const stepSequence = [
+      { a1: true,  a2: false, b1: true,  b2: false },
+      { a1: false, a2: true,  b1: true,  b2: false },
+      { a1: false, a2: true,  b1: false, b2: true  },
+      { a1: true,  a2: false, b1: false, b2: true  }
+    ];
+    
+    // Initialize with some mock log entries
     document.addEventListener('DOMContentLoaded', function() {
+      updateSettings();
       initChart();
-      startPolling();
-      loadSettings();
+      addMockLogEntries();
     });
     
     // Chart initialization
@@ -855,42 +738,52 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       addChartPoint(0, 0);
     }
     
-    // Polling for status updates
-    function startPolling() {
-      pollInterval = setInterval(fetchStatus, 100);
+    function resetAll() {
+      resetChart();
+      clearLog();
+      pcmDirection = 0;
+      updateDirectionDisplay();
     }
     
-    function fetchStatus() {
-      fetch('/api/status')
-        .then(r => r.json())
-        .then(data => {
-          updateSignalLeds(data.pcm);
-          updateMotorStatus(data.motor);
-          updateDirectionDisplay(data.motor, data.pcm);
-          
-          // Update chart with positions from server
-          if (data.motor.position !== undefined && data.pcm.position !== undefined) {
-            youStepPosition = data.motor.position;
-            pcmStepPosition = data.pcm.position;
-            addChartPoint(youStepPosition, pcmStepPosition);
-          }
-          
-          if (!isLogPaused && data.log && data.log.length > 0) {
-            appendLogEntries(data.log);
-          }
-        })
-        .catch(err => console.error('Status fetch error:', err));
+    function addMockLogEntries() {
+      const mockEntries = [
+        { ts: Date.now() - 5000, a1: 1, a2: 0, b1: 1, b2: 0, iac: false },
+        { ts: Date.now() - 4500, a1: 0, a2: 1, b1: 1, b2: 0, iac: false },
+        { ts: Date.now() - 4000, a1: 0, a2: 1, b1: 0, b2: 1, iac: true },
+        { ts: Date.now() - 3500, a1: 1, a2: 0, b1: 0, b2: 1, iac: true },
+        { ts: Date.now() - 3000, a1: 1, a2: 0, b1: 1, b2: 0, iac: false },
+      ];
+      appendLogEntries(mockEntries);
     }
     
-    function updateDirectionDisplay(motor, pcm) {
+    function updateSignalLeds(pcm) {
+      document.getElementById('ledA1').className = 'led' + (pcm.a1 ? ' on' : '');
+      document.getElementById('ledA2').className = 'led' + (pcm.a2 ? ' on' : '');
+      document.getElementById('ledB1').className = 'led' + (pcm.b1 ? ' on' : '');
+      document.getElementById('ledB2').className = 'led' + (pcm.b2 ? ' on' : '');
+    }
+    
+    function updateMotorStatus() {
+      const indicator = document.getElementById('motorIndicator');
+      const text = document.getElementById('motorStatusText');
+      
+      if (isMoving) {
+        indicator.className = 'indicator moving';
+        text.textContent = 'Motor: Moving (' + (moveDirection > 0 ? 'Extend' : 'Retract') + ')';
+      } else {
+        indicator.className = 'indicator';
+        text.textContent = 'Motor: Idle';
+      }
+    }
+    
+    function updateDirectionDisplay() {
       const yourDirEl = document.getElementById('yourDirection');
       const pcmDirEl = document.getElementById('pcmDirection');
       const relEl = document.getElementById('relationshipIndicator');
       
       // Your direction
-      if (motor.moving) {
-        currentYouDirection = motor.direction;
-        if (motor.direction > 0) {
+      if (isMoving) {
+        if (moveDirection > 0) {
           yourDirEl.textContent = 'EXTEND';
           yourDirEl.className = 'value extend';
         } else {
@@ -898,16 +791,15 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           yourDirEl.className = 'value retract';
         }
       } else {
-        currentYouDirection = 0;
         yourDirEl.textContent = 'IDLE';
         yourDirEl.className = 'value idle';
       }
       
       // PCM direction
-      if (pcm.direction > 0) {
+      if (pcmDirection > 0) {
         pcmDirEl.textContent = 'EXTEND';
         pcmDirEl.className = 'value extend';
-      } else if (pcm.direction < 0) {
+      } else if (pcmDirection < 0) {
         pcmDirEl.textContent = 'RETRACT';
         pcmDirEl.className = 'value retract';
       } else {
@@ -916,45 +808,22 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }
       
       // Relationship indicator
-      if (currentYouDirection === 0 && pcm.direction === 0) {
+      const youDir = isMoving ? moveDirection : 0;
+      if (youDir === 0 && pcmDirection === 0) {
         relEl.textContent = 'Waiting for activity...';
         relEl.className = 'relationship-indicator neutral';
-      } else if (currentYouDirection === 0) {
+      } else if (youDir === 0) {
         relEl.textContent = 'PCM is adjusting (you idle)';
         relEl.className = 'relationship-indicator neutral';
-      } else if (pcm.direction === 0) {
+      } else if (pcmDirection === 0) {
         relEl.textContent = 'PCM not responding yet...';
         relEl.className = 'relationship-indicator neutral';
-      } else if (currentYouDirection !== pcm.direction) {
+      } else if (youDir !== pcmDirection) {
         relEl.textContent = '✓ PCM OPPOSING - Feedback loop working!';
         relEl.className = 'relationship-indicator opposing';
       } else {
         relEl.textContent = '⚠ PCM SAME DIRECTION - Unexpected!';
         relEl.className = 'relationship-indicator same';
-      }
-    }
-    
-    function updateSignalLeds(pcm) {
-      // Note: Optocoupler inverts, so we show the logical PCM state
-      document.getElementById('ledA1').className = 'led' + (pcm.a1 ? ' on' : '');
-      document.getElementById('ledA2').className = 'led' + (pcm.a2 ? ' on' : '');
-      document.getElementById('ledB1').className = 'led' + (pcm.b1 ? ' on' : '');
-      document.getElementById('ledB2').className = 'led' + (pcm.b2 ? ' on' : '');
-    }
-    
-    function updateMotorStatus(motor) {
-      const indicator = document.getElementById('motorIndicator');
-      const text = document.getElementById('motorStatusText');
-      
-      if (motor.moving) {
-        indicator.className = 'indicator moving';
-        text.textContent = 'Motor: Moving (' + (motor.direction > 0 ? 'Extend' : 'Retract') + ')';
-      } else if (motor.enabled) {
-        indicator.className = 'indicator enabled';
-        text.textContent = 'Motor: Ready';
-      } else {
-        indicator.className = 'indicator';
-        text.textContent = 'Motor: Idle';
       }
     }
     
@@ -978,36 +847,106 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         logData.push(entry);
       });
       
-      // Auto-scroll to bottom
       container.scrollTop = container.scrollHeight;
       
-      // Limit displayed entries
       while (container.children.length > 200) {
         container.removeChild(container.firstChild);
       }
     }
     
-    // Motor control functions
+    // Motor control (preview simulation)
+    let yourStepInterval = null;
+    
     function startMove(direction) {
-      iacButtonActive = true;
-      const dir = direction === 'extend' ? 1 : -1;
-      fetch('/api/move?continuous=1&direction=' + dir, { method: 'POST' });
+      isMoving = true;
+      moveDirection = direction === 'extend' ? 1 : -1;
       document.getElementById(direction === 'extend' ? 'btnExtend' : 'btnRetract').classList.add('active');
+      updateMotorStatus();
+      updateDirectionDisplay();
+      console.log('[PREVIEW] Would send: POST /api/move?continuous=1&direction=' + moveDirection);
+      
+      // Start incrementing your step position
+      yourStepInterval = setInterval(() => {
+        youStepPosition += moveDirection;
+        addChartPoint(youStepPosition, pcmStepPosition);
+      }, parseInt(document.getElementById('stepDelay').value) || 50);
+      
+      // Simulate PCM opposing after a short delay (like real feedback)
+      setTimeout(() => {
+        if (isMoving) {
+          pcmDirection = -moveDirection;  // PCM opposes!
+          startPcmSimulation(pcmDirection);
+          updateDirectionDisplay();
+        }
+      }, 300);
     }
     
     function stopMove() {
-      iacButtonActive = false;
-      fetch('/api/stop', { method: 'POST' });
+      isMoving = false;
+      moveDirection = 0;
       document.getElementById('btnExtend').classList.remove('active');
       document.getElementById('btnRetract').classList.remove('active');
+      updateMotorStatus();
+      updateDirectionDisplay();
+      console.log('[PREVIEW] Would send: POST /api/stop');
+      
+      // Stop your step interval
+      if (yourStepInterval) {
+        clearInterval(yourStepInterval);
+        yourStepInterval = null;
+      }
+      
+      // PCM goes idle after you stop (with delay)
+      setTimeout(() => {
+        if (!isMoving) {
+          pcmDirection = 0;
+          stopPcmSimulation();
+          updateDirectionDisplay();
+        }
+      }, 500);
     }
     
     function moveSteps(steps, direction) {
-      fetch('/api/move?steps=' + steps + '&direction=' + direction, { method: 'POST' });
+      console.log('[PREVIEW] Would send: POST /api/move?steps=' + steps + '&direction=' + direction);
+      
+      // Simulate the movement with a brief indicator flash
+      isMoving = true;
+      moveDirection = direction;
+      updateMotorStatus();
+      updateDirectionDisplay();
+      
+      // Increment your position immediately
+      youStepPosition += (steps * direction);
+      addChartPoint(youStepPosition, pcmStepPosition);
+      
+      // Simulate PCM opposing
+      setTimeout(() => {
+        pcmDirection = -direction;
+        startPcmSimulation(pcmDirection);
+        updateDirectionDisplay();
+      }, 200);
+      
+      setTimeout(() => {
+        isMoving = false;
+        moveDirection = 0;
+        updateMotorStatus();
+        updateDirectionDisplay();
+        
+        // PCM continues briefly then stops
+        setTimeout(() => {
+          pcmDirection = 0;
+          stopPcmSimulation();
+          updateDirectionDisplay();
+        }, 300);
+      }, steps * 20);
     }
     
     function emergencyStop() {
-      fetch('/api/stop?emergency=1', { method: 'POST' });
+      stopMove();
+      pcmDirection = 0;
+      stopPcmSimulation();
+      updateDirectionDisplay();
+      console.log('[PREVIEW] Would send: POST /api/stop?emergency=1');
     }
     
     // Settings
@@ -1015,30 +954,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       const delay = document.getElementById('stepDelay').value;
       const freq = (1000 / delay).toFixed(1);
       document.getElementById('frequencyDisplay').textContent = freq + ' Hz';
-      
-      fetch('/api/settings?delay=' + delay, { method: 'POST' });
-    }
-    
-    function loadSettings() {
-      fetch('/api/settings')
-        .then(r => r.json())
-        .then(data => {
-          document.getElementById('stepDelay').value = data.delay;
-          updateSettings();
-        });
+      console.log('[PREVIEW] Would send: POST /api/settings?delay=' + delay);
     }
     
     // Log controls
     function clearLog() {
       document.getElementById('logContainer').innerHTML = '';
       logData = [];
-      fetch('/api/log/clear', { method: 'POST' });
-    }
-    
-    function resetAll() {
-      fetch('/api/reset', { method: 'POST' });
-      resetChart();
-      clearLog();
+      console.log('[PREVIEW] Would send: POST /api/log/clear');
     }
     
     function toggleLogPause() {
@@ -1066,301 +989,64 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       a.click();
       URL.revokeObjectURL(url);
     }
+    
+    // PCM Simulation helpers
+    function startPcmSimulation(direction) {
+      if (simulationInterval) return;  // Already running
+      
+      simulationInterval = setInterval(() => {
+        // Advance step in the correct direction
+        if (direction > 0) {
+          stepIndex = (stepIndex + 1) % 4;  // Forward = extend
+          pcmStepPosition += 1;
+        } else {
+          stepIndex = (stepIndex + 3) % 4;  // Backward = retract
+          pcmStepPosition -= 1;
+        }
+        pcmState = stepSequence[stepIndex];
+        
+        // Update LEDs
+        updateSignalLeds(pcmState);
+        
+        // Update chart
+        addChartPoint(youStepPosition, pcmStepPosition);
+        
+        // Add log entry if not paused
+        if (!isLogPaused) {
+          appendLogEntries([{
+            ts: Date.now(),
+            a1: pcmState.a1 ? 1 : 0,
+            a2: pcmState.a2 ? 1 : 0,
+            b1: pcmState.b1 ? 1 : 0,
+            b2: pcmState.b2 ? 1 : 0,
+            iac: isMoving
+          }]);
+        }
+      }, parseInt(document.getElementById('stepDelay').value) || 50);
+    }
+    
+    function stopPcmSimulation() {
+      if (simulationInterval) {
+        clearInterval(simulationInterval);
+        simulationInterval = null;
+      }
+    }
+    
+    // Manual simulate button (toggles independent PCM activity)
+    function simulateSignals() {
+      if (simulationInterval) {
+        stopPcmSimulation();
+        pcmDirection = 0;
+        updateDirectionDisplay();
+        console.log('[PREVIEW] PCM simulation stopped');
+        return;
+      }
+      
+      console.log('[PREVIEW] PCM simulation started (extending)');
+      pcmDirection = 1;  // Default to extend when manually triggered
+      updateDirectionDisplay();
+      startPcmSimulation(1);
+    }
   </script>
 </body>
 </html>
-)rawliteral";
-
-// ============================================
-// SETUP
-// ============================================
-
-void setup() {
-  Serial.begin(115200);
-  Serial.println("\n\nIAC Valve Tester Starting...");
-  
-  // Initialize motor driver pins
-  pinMode(PIN_AIN1, OUTPUT);
-  pinMode(PIN_AIN2, OUTPUT);
-  pinMode(PIN_BIN1, OUTPUT);
-  pinMode(PIN_BIN2, OUTPUT);
-  pinMode(PIN_STBY, OUTPUT);
-  
-  // Start with motor disabled
-  digitalWrite(PIN_STBY, LOW);
-  setMotorOutputs(LOW, LOW, LOW, LOW);
-  
-  // Initialize PCM monitor pins (optocoupler outputs)
-  pinMode(PIN_PCM_A1, INPUT_PULLUP);
-  pinMode(PIN_PCM_A2, INPUT_PULLUP);
-  pinMode(PIN_PCM_B1, INPUT_PULLUP);
-  pinMode(PIN_PCM_B2, INPUT_PULLUP);
-  
-  // Initialize WiFi
-  if (AP_MODE) {
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
-    Serial.print("Access Point started. IP: ");
-    Serial.println(WiFi.softAPIP());
-  } else {
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.print("Connecting to WiFi");
-    while (WiFi.status() != WL_CONNECTED) {
-      delay(500);
-      Serial.print(".");
-    }
-    Serial.print("\nConnected! IP: ");
-    Serial.println(WiFi.localIP());
-  }
-  
-  // Setup web server routes
-  server.on("/", handleRoot);
-  server.on("/api/status", handleStatus);
-  server.on("/api/move", handleMove);
-  server.on("/api/stop", handleStop);
-  server.on("/api/settings", handleSettings);
-  server.on("/api/log/clear", handleLogClear);
-  server.on("/api/reset", handleReset);
-  
-  server.begin();
-  Serial.println("Web server started");
-}
-
-// ============================================
-// MAIN LOOP
-// ============================================
-
-void loop() {
-  server.handleClient();
-  
-  // Monitor PCM signals for changes
-  monitorPcmSignals();
-  
-  // Execute stepper movement if needed
-  if (isMoving && targetSteps != 0) {
-    executeStep();
-    targetSteps += (stepDirection > 0) ? -1 : 1;
-    
-    if (targetSteps == 0) {
-      isMoving = false;
-    }
-    
-    delay(stepDelayMs);
-  } else if (isMoving && targetSteps == 0) {
-    // Continuous mode - keep moving
-    executeStep();
-    delay(stepDelayMs);
-  }
-}
-
-// ============================================
-// MOTOR CONTROL FUNCTIONS
-// ============================================
-
-void setMotorOutputs(int a1, int a2, int b1, int b2) {
-  digitalWrite(PIN_AIN1, a1);
-  digitalWrite(PIN_AIN2, a2);
-  digitalWrite(PIN_BIN1, b1);
-  digitalWrite(PIN_BIN2, b2);
-}
-
-void executeStep() {
-  // Update step position
-  currentStep += stepDirection;
-  if (currentStep > 3) currentStep = 0;
-  if (currentStep < 0) currentStep = 3;
-  
-  // Track cumulative position
-  youStepPosition += stepDirection;
-  
-  // Apply step sequence
-  setMotorOutputs(
-    STEP_SEQUENCE[currentStep][0],
-    STEP_SEQUENCE[currentStep][1],
-    STEP_SEQUENCE[currentStep][2],
-    STEP_SEQUENCE[currentStep][3]
-  );
-}
-
-void enableMotor() {
-  digitalWrite(PIN_STBY, HIGH);
-  motorEnabled = true;
-}
-
-void disableMotor() {
-  digitalWrite(PIN_STBY, LOW);
-  setMotorOutputs(LOW, LOW, LOW, LOW);
-  motorEnabled = false;
-  isMoving = false;
-  targetSteps = 0;
-}
-
-// ============================================
-// PCM SIGNAL MONITORING
-// ============================================
-
-void monitorPcmSignals() {
-  // Read current state (inverted due to optocoupler)
-  uint8_t currentState = 0;
-  currentState |= (!digitalRead(PIN_PCM_A1)) << 0;
-  currentState |= (!digitalRead(PIN_PCM_A2)) << 1;
-  currentState |= (!digitalRead(PIN_PCM_B1)) << 2;
-  currentState |= (!digitalRead(PIN_PCM_B2)) << 3;
-  
-  // Check for idle timeout
-  if (millis() - lastPcmChange > PCM_IDLE_TIMEOUT) {
-    pcmDirection = 0;  // Idle
-  }
-  
-  // Check for change
-  if (currentState != prevPcmState) {
-    lastPcmChange = millis();
-    
-    // Detect which step this pattern represents
-    int8_t newStepIndex = STEP_LOOKUP[currentState];
-    
-    if (newStepIndex >= 0 && pcmStepIndex >= 0) {
-      // Valid step transition - calculate direction
-      // Forward (extend): 0->1->2->3->0
-      // Reverse (retract): 0->3->2->1->0
-      
-      int expectedForward = (pcmStepIndex + 1) % 4;
-      int expectedReverse = (pcmStepIndex + 3) % 4;  // Same as (pcmStepIndex - 1 + 4) % 4
-      
-      if (newStepIndex == expectedForward) {
-        pcmDirection = 1;  // Extend
-        pcmStepPosition += 1;  // Track cumulative
-      } else if (newStepIndex == expectedReverse) {
-        pcmDirection = -1; // Retract
-        pcmStepPosition -= 1;  // Track cumulative
-      }
-      // else: unexpected transition, keep previous direction
-    }
-    
-    prevPcmStepIndex = pcmStepIndex;
-    pcmStepIndex = newStepIndex;
-    
-    // Log the change
-    signalLog[logIndex].timestamp = millis();
-    signalLog[logIndex].pcmA1 = (currentState >> 0) & 1;
-    signalLog[logIndex].pcmA2 = (currentState >> 1) & 1;
-    signalLog[logIndex].pcmB1 = (currentState >> 2) & 1;
-    signalLog[logIndex].pcmB2 = (currentState >> 3) & 1;
-    signalLog[logIndex].iacActive = isMoving ? 1 : 0;
-    
-    logIndex = (logIndex + 1) % LOG_BUFFER_SIZE;
-    if (logCount < LOG_BUFFER_SIZE) logCount++;
-    
-    prevPcmState = currentState;
-  }
-}
-
-// ============================================
-// WEB SERVER HANDLERS
-// ============================================
-
-void handleRoot() {
-  server.send(200, "text/html", INDEX_HTML);
-}
-
-void handleStatus() {
-  StaticJsonDocument<512> doc;
-  
-  // PCM signals (inverted from optocoupler)
-  JsonObject pcm = doc.createNestedObject("pcm");
-  pcm["a1"] = !digitalRead(PIN_PCM_A1);
-  pcm["a2"] = !digitalRead(PIN_PCM_A2);
-  pcm["b1"] = !digitalRead(PIN_PCM_B1);
-  pcm["b2"] = !digitalRead(PIN_PCM_B2);
-  pcm["direction"] = pcmDirection;  // 1=extend, -1=retract, 0=idle
-  pcm["step"] = pcmStepIndex;
-  
-  // Motor status
-  JsonObject motor = doc.createNestedObject("motor");
-  motor["enabled"] = motorEnabled;
-  motor["moving"] = isMoving;
-  motor["direction"] = stepDirection;
-  motor["step"] = currentStep;
-  motor["position"] = youStepPosition;  // Cumulative position
-  
-  // Add PCM position
-  pcm["position"] = pcmStepPosition;
-  
-  // Recent log entries (send up to 10 new entries)
-  JsonArray log = doc.createNestedArray("log");
-  static int lastSentIndex = 0;
-  int entriesToSend = 0;
-  
-  while (lastSentIndex != logIndex && entriesToSend < 10) {
-    JsonObject entry = log.createNestedObject();
-    entry["ts"] = signalLog[lastSentIndex].timestamp;
-    entry["a1"] = signalLog[lastSentIndex].pcmA1;
-    entry["a2"] = signalLog[lastSentIndex].pcmA2;
-    entry["b1"] = signalLog[lastSentIndex].pcmB1;
-    entry["b2"] = signalLog[lastSentIndex].pcmB2;
-    entry["iac"] = signalLog[lastSentIndex].iacActive;
-    
-    lastSentIndex = (lastSentIndex + 1) % LOG_BUFFER_SIZE;
-    entriesToSend++;
-  }
-  
-  String response;
-  serializeJson(doc, response);
-  server.send(200, "application/json", response);
-}
-
-void handleMove() {
-  enableMotor();
-  
-  if (server.hasArg("continuous")) {
-    // Continuous movement mode (hold button)
-    stepDirection = server.arg("direction").toInt();
-    targetSteps = 0;  // 0 = continuous
-    isMoving = true;
-  } else if (server.hasArg("steps")) {
-    // Fixed step count mode
-    targetSteps = server.arg("steps").toInt();
-    stepDirection = server.arg("direction").toInt();
-    isMoving = true;
-  }
-  
-  server.send(200, "application/json", "{\"ok\":true}");
-}
-
-void handleStop() {
-  if (server.hasArg("emergency")) {
-    disableMotor();
-  } else {
-    isMoving = false;
-    targetSteps = 0;
-  }
-  
-  server.send(200, "application/json", "{\"ok\":true}");
-}
-
-void handleSettings() {
-  if (server.method() == HTTP_POST) {
-    if (server.hasArg("delay")) {
-      stepDelayMs = server.arg("delay").toInt();
-      if (stepDelayMs < 1) stepDelayMs = 1;
-      if (stepDelayMs > 500) stepDelayMs = 500;
-    }
-    server.send(200, "application/json", "{\"ok\":true}");
-  } else {
-    String response = "{\"delay\":" + String(stepDelayMs) + "}";
-    server.send(200, "application/json", response);
-  }
-}
-
-void handleLogClear() {
-  logIndex = 0;
-  logCount = 0;
-  server.send(200, "application/json", "{\"ok\":true}");
-}
-
-void handleReset() {
-  youStepPosition = 0;
-  pcmStepPosition = 0;
-  logIndex = 0;
-  logCount = 0;
-  server.send(200, "application/json", "{\"ok\":true}");
-}

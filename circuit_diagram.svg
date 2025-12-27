@@ -23,7 +23,7 @@
   
   <!-- Title -->
   <text x="600" y="40" text-anchor="middle" class="title">IAC VALVE TESTER - WIRING DIAGRAM</text>
-  <text x="600" y="60" text-anchor="middle" class="subtitle">1997 Jeep Wrangler 2.5L • ESP32 + TB6612FNG + PC817</text>
+  <text x="600" y="60" text-anchor="middle" class="subtitle">1997 Jeep Wrangler 2.5L • ESP32-S3 + TB6612FNG + PC817</text>
   
   <!-- Legend -->
   <g transform="translate(950, 80)">
@@ -74,15 +74,15 @@
   <path d="M 170 180 L 250 160" class="wire-power"/>
   <path d="M 170 205 L 200 205 L 200 200 L 250 200" class="wire-gnd"/>
   
-  <!-- ESP32 -->
+  <!-- ESP32-S3 -->
   <g transform="translate(480, 100)">
     <rect x="0" y="0" width="180" height="280" class="component-box-highlight"/>
-    <text x="90" y="30" text-anchor="middle" class="component-label">ESP32</text>
-    <text x="90" y="50" text-anchor="middle" class="component-label">DevKitC</text>
+    <text x="90" y="30" text-anchor="middle" class="component-label">ESP32-S3</text>
+    <text x="90" y="50" text-anchor="middle" class="component-label">WROOM-1</text>
     
     <!-- Power pins (left side) -->
     <circle cx="0" cy="80" r="4" class="pin-dot"/>
-    <text x="10" y="85" class="pin-label">VIN (5V)</text>
+    <text x="10" y="85" class="pin-label">5V/VIN</text>
     <circle cx="0" cy="100" r="4" class="pin-dot"/>
     <text x="10" y="105" class="pin-label">GND</text>
     <circle cx="0" cy="120" r="4" class="pin-dot"/>
@@ -90,25 +90,25 @@
     
     <!-- Motor control pins (right side) -->
     <circle cx="180" cy="80" r="4" class="pin-dot"/>
-    <text x="100" y="85" class="pin-label">GPIO25 (AIN1)</text>
+    <text x="105" y="85" class="pin-label">GPIO5 (AIN1)</text>
     <circle cx="180" cy="100" r="4" class="pin-dot"/>
-    <text x="100" y="105" class="pin-label">GPIO26 (AIN2)</text>
+    <text x="105" y="105" class="pin-label">GPIO6 (AIN2)</text>
     <circle cx="180" cy="120" r="4" class="pin-dot"/>
-    <text x="100" y="125" class="pin-label">GPIO27 (BIN1)</text>
+    <text x="105" y="125" class="pin-label">GPIO7 (BIN1)</text>
     <circle cx="180" cy="140" r="4" class="pin-dot"/>
-    <text x="100" y="145" class="pin-label">GPIO14 (BIN2)</text>
+    <text x="100" y="145" class="pin-label">GPIO15 (BIN2)</text>
     <circle cx="180" cy="160" r="4" class="pin-dot"/>
-    <text x="100" y="165" class="pin-label">GPIO13 (STBY)</text>
+    <text x="100" y="165" class="pin-label">GPIO16 (STBY)</text>
     
     <!-- PCM monitor pins (right side, lower) -->
     <circle cx="180" cy="200" r="4" class="pin-dot"/>
-    <text x="95" y="205" class="pin-label">GPIO32 (PCM_A1)</text>
+    <text x="95" y="205" class="pin-label">GPIO17 (PCM_A1)</text>
     <circle cx="180" cy="220" r="4" class="pin-dot"/>
-    <text x="95" y="225" class="pin-label">GPIO33 (PCM_A2)</text>
+    <text x="95" y="225" class="pin-label">GPIO18 (PCM_A2)</text>
     <circle cx="180" cy="240" r="4" class="pin-dot"/>
-    <text x="95" y="245" class="pin-label">GPIO34 (PCM_B1)</text>
+    <text x="100" y="245" class="pin-label">GPIO8 (PCM_B1)</text>
     <circle cx="180" cy="260" r="4" class="pin-dot"/>
-    <text x="95" y="265" class="pin-label">GPIO35 (PCM_B2)</text>
+    <text x="100" y="265" class="pin-label">GPIO3 (PCM_B2)</text>
   </g>
   
   <!-- Wire: Buck to ESP32 5V -->
@@ -302,19 +302,19 @@
   <!-- Pin mapping reference -->
   <g transform="translate(800, 450)">
     <rect x="0" y="0" width="300" height="220" class="component-box"/>
-    <text x="150" y="25" text-anchor="middle" class="component-label">ESP32 PIN SUMMARY</text>
+    <text x="150" y="25" text-anchor="middle" class="component-label">ESP32-S3 PIN SUMMARY</text>
     
     <text x="20" y="55" class="pin-label">MOTOR CONTROL:</text>
-    <text x="30" y="75" class="note">GPIO25 → TB6612 AIN1</text>
-    <text x="30" y="95" class="note">GPIO26 → TB6612 AIN2</text>
-    <text x="30" y="115" class="note">GPIO27 → TB6612 BIN1</text>
-    <text x="30" y="135" class="note">GPIO14 → TB6612 BIN2</text>
-    <text x="30" y="155" class="note">GPIO13 → TB6612 STBY</text>
+    <text x="30" y="75" class="note">GPIO5  → TB6612 AIN1</text>
+    <text x="30" y="95" class="note">GPIO6  → TB6612 AIN2</text>
+    <text x="30" y="115" class="note">GPIO7  → TB6612 BIN1</text>
+    <text x="30" y="135" class="note">GPIO15 → TB6612 BIN2</text>
+    <text x="30" y="155" class="note">GPIO16 → TB6612 STBY</text>
     
     <text x="20" y="185" class="pin-label">PCM MONITORING:</text>
-    <text x="30" y="205" class="note">GPIO32 ← PC817 OUT1 (PCM A1)</text>
-    <text x="30" y="225" class="note">GPIO33 ← PC817 OUT2 (PCM A2)</text>
-    <text x="30" y="245" class="note">GPIO34 ← PC817 OUT3 (PCM B1)</text>
-    <text x="30" y="265" class="note">GPIO35 ← PC817 OUT4 (PCM B2)</text>
+    <text x="30" y="205" class="note">GPIO17 ← PC817 OUT1 (PCM A1)</text>
+    <text x="30" y="225" class="note">GPIO18 ← PC817 OUT2 (PCM A2)</text>
+    <text x="30" y="245" class="note">GPIO8  ← PC817 OUT3 (PCM B1)</text>
+    <text x="30" y="265" class="note">GPIO3  ← PC817 OUT4 (PCM B2)</text>
   </g>
 </svg>

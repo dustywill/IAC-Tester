@@ -13,7 +13,7 @@ This project allows you to:
 
 | Component | Qty | Purpose |
 |-----------|-----|---------|
-| ESP32 DevKitC | 1 | Main controller + WiFi |
+| ESP32-S3-WROOM-1 | 1 | Main controller + WiFi |
 | TB6612FNG Motor Driver | 1 | Drive IAC stepper (12V) |
 | PC817 8-Channel Optocoupler | 1 | Isolate PCM signals |
 | LM2596 Buck Converter | 1 | 12V → 5V for ESP32 |
@@ -28,27 +28,27 @@ This project allows you to:
 ### Power Distribution
 
 ```
-CAR 12V ──[5A FUSE]──┬── LM2596 IN+ ── OUT+ (5V) ──► ESP32 VIN
+CAR 12V ──[5A FUSE]──┬── LM2596 IN+ ── OUT+ (5V) ──► ESP32-S3 5V/VIN
                      │
                      └── TB6612 VM (motor power)
 
 CAR GND ─────────────┬── LM2596 IN-
                      ├── TB6612 GND
-                     ├── ESP32 GND
+                     ├── ESP32-S3 GND
                      └── PC817 GND
 ```
 
-### ESP32 to TB6612FNG (Motor Control)
+### ESP32-S3 to TB6612FNG (Motor Control)
 
 ```
-ESP32 Pin    →    TB6612 Pin    Description
+ESP32-S3 Pin    →    TB6612 Pin    Description
 ─────────────────────────────────────────────
-GPIO25       →    AIN1          Coil A control 1
-GPIO26       →    AIN2          Coil A control 2
-GPIO27       →    BIN1          Coil B control 1
-GPIO14       →    BIN2          Coil B control 2
-GPIO13       →    STBY          Standby (HIGH = enabled)
-3.3V         →    VCC           Logic power
+GPIO5           →    AIN1          Coil A control 1
+GPIO6           →    AIN2          Coil A control 2
+GPIO7           →    BIN1          Coil B control 1
+GPIO15          →    BIN2          Coil B control 2
+GPIO16          →    STBY          Standby (HIGH = enabled)
+3.3V            →    VCC           Logic power
 ```
 
 ### TB6612FNG to IAC Valve
@@ -76,17 +76,17 @@ B1 wire         →    IN3+           Coil B signal 1
 B2 wire         →    IN4+           Coil B signal 2
 ```
 
-### PC817 Optocoupler to ESP32 (Signal Monitoring)
+### PC817 Optocoupler to ESP32-S3 (Signal Monitoring)
 
 ```
-PC817 Output    →    ESP32 Pin    Description
+PC817 Output    →    ESP32-S3 Pin    Description
 ─────────────────────────────────────────────────
-OUT1            →    GPIO32       PCM A1 state
-OUT2            →    GPIO33       PCM A2 state
-OUT3            →    GPIO34       PCM B1 state
-OUT4            →    GPIO35       PCM B2 state
-VCC             →    3.3V         Optocoupler logic power
-GND             →    GND          Common ground
+OUT1            →    GPIO17          PCM A1 state
+OUT2            →    GPIO18          PCM A2 state
+OUT3            →    GPIO8           PCM B1 state
+OUT4            →    GPIO3           PCM B2 state
+VCC             →    3.3V            Optocoupler logic power
+GND             →    GND             Common ground
 ```
 
 ---
@@ -129,7 +129,7 @@ GND             →    GND          Common ground
 
 ### Prerequisites
 - Arduino IDE 2.x (or PlatformIO)
-- ESP32 board package installed
+- ESP32 board package installed (version 2.0.0 or later for S3 support)
 - ArduinoJson library installed
 
 ### Configuration
@@ -149,10 +149,11 @@ const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 ```
 
 ### Upload
-1. Connect ESP32 via USB
-2. Select board: "ESP32 Dev Module"
+1. Connect ESP32-S3 via USB
+2. Select board: "ESP32S3 Dev Module"
 3. Select correct COM port
-4. Upload
+4. Set USB CDC On Boot: "Enabled" (for serial monitor via USB)
+5. Upload
 
 ### Connect
 - **AP Mode:** Connect phone/laptop to "IAC_Tester" WiFi, browse to `192.168.4.1`
