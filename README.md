@@ -38,6 +38,22 @@ CAR GND ─────────────┬── LM2596 IN-
                      └── PC817 GND
 ```
 
+### Capacitor Wiring (Motor Noise Filter)
+
+The 10µF capacitor filters voltage spikes from the stepper motor. Wire it directly across the motor power pins:
+
+```
+TB6612 VM (12V) ────┬──── 12V Power In
+                    │
+                  ──┴──  (+) Capacitor positive leg
+                  ─────  10µF 50V
+                    │    (-) Capacitor negative leg
+                    │
+TB6612 GND ─────────┴──── Ground
+```
+
+Keep the capacitor leads short and place it as close to the TB6612FNG as possible.
+
 ### ESP32-S3 to TB6612FNG (Motor Control)
 
 ```
@@ -78,16 +94,37 @@ B2 wire         →    IN4+           Coil B signal 2
 
 ### PC817 Optocoupler to ESP32-S3 (Signal Monitoring)
 
+Your PC817 8-channel board has 4 pins per channel: IN+, IN-, OUT+, OUT-
+
+**Setup:**
+1. Install jumpers on channels 1-4 (connects OUT- to common ground)
+2. All IN- pins connect to common ground
+
 ```
-PC817 Output    →    ESP32-S3 Pin    Description
-─────────────────────────────────────────────────
-OUT1            →    GPIO17          PCM A1 state
-OUT2            →    GPIO18          PCM A2 state
-OUT3            →    GPIO8           PCM B1 state
-OUT4            →    GPIO3           PCM B2 state
-VCC             →    3.3V            Optocoupler logic power
-GND             →    GND             Common ground
+PC817 Pin       →    Connection          Description
+─────────────────────────────────────────────────────────
+IN1+            ←    PCM A1              PCM signal input
+IN1-            →    GND                 Common ground
+OUT1+           →    GPIO17              To ESP32 (with internal pull-up)
+OUT1- (jumper)  →    GND                 Via jumper to ground
+
+IN2+            ←    PCM A2              PCM signal input
+IN2-            →    GND                 Common ground
+OUT2+           →    GPIO18              To ESP32 (with internal pull-up)
+OUT2- (jumper)  →    GND                 Via jumper to ground
+
+IN3+            ←    PCM B1              PCM signal input
+IN3-            →    GND                 Common ground
+OUT3+           →    GPIO8               To ESP32 (with internal pull-up)
+OUT3- (jumper)  →    GND                 Via jumper to ground
+
+IN4+            ←    PCM B2              PCM signal input
+IN4-            →    GND                 Common ground
+OUT4+           →    GPIO3               To ESP32 (with internal pull-up)
+OUT4- (jumper)  →    GND                 Via jumper to ground
 ```
+
+**How it works:** When PCM drives 12V on IN+, the optocoupler conducts and pulls OUT+ LOW. The ESP32's internal pull-up keeps OUT+ HIGH when no signal. Code inverts the reading.
 
 ---
 
