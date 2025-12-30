@@ -256,6 +256,12 @@ int stepDelayMs = 20;  // milliseconds per step
 
 Pins can be changed via the web interface without recompiling. Settings are stored in non-volatile memory and persist across reboots.
 
+### The Jeep wiring
+Using the Jeep wiring diagrams The IAC wiring harness connector has Sockets A,B,C,D that connect to the PCM connector pins 20,11,10,19 respectively.
+IAC Connector
+![IAC Connector](image.png)
+![PCM Connector](image-1.png)
+
 ## Troubleshooting
 
 ### No Serial Output
