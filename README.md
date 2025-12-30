@@ -68,6 +68,8 @@ This project allows you to:
 | LM2596 | DC-DC buck converter (12V to 5V) | 1 |
 | 10uF Capacitor | Electrolytic, 16V+ rated | 1 |
 | Jumper wires | For connections | As needed |
+| [Idle Air Control Valve Connector](https://www.autozone.com/p/duralast-idle-air-control-valve-connector-217/342417) | To connect to drive the IAC Valve | 1 |
+| Cheap IAC Valve | You can't find the other side of the connector | 1 |
 
 ### Why These Components?
 
@@ -75,10 +77,15 @@ This project allows you to:
 - **TB6612FNG**: Handles bipolar stepper motor driving, 3.3V logic compatible
 - **PC817 Optocoupler**: Galvanic isolation protects ESP32 from automotive voltages
 - **LM2596**: Efficiently converts 12V vehicle power to 5V for ESP32
+- **Duralass Connector**: I bought the Duralast connector because i was tired of waiting for th thing to be done and diagnosed. You can find them much cheaper on amazon or other online retailers.
+- **Cheap IAC Valve**: You cannot find the mating connector for the IAC side of the Connector to connect the PCM to, so I had to butcher an IAC valve and use that IAC as the connector.
 
 ## Wiring
 
 See `circuit_diagram.svg` for the complete wiring diagram.
+
+### The Cheap IAC
+I sanded off the back side fof he 90 degree connector and found that there were some pins that were molded ointot the tback of the IAC valve, so I was able to solder directly to those. This allowed me to connect the PCM to the cheap IAC and be abebleo see the cheap IAC move as well as tap that signal from the PCM and record those values in ESP32 tester's memory for download.
 
 ### Default Pin Assignments
 
@@ -288,7 +295,7 @@ Pins can be changed via the web interface without recompiling. Settings are stor
 
 ### 1997 Jeep Wrangler 2.5L (TJ)
 
-- IAC valve is a 4-wire bipolar stepper motor
+- IAC valve is a 4-wire bipolar stepper motor wwith 90 degree connector
 - Located on the throttle body
 - PCM connector pinout: A1, A2, B1, B2
 - Normal idle position: ~20-40 steps from closed
