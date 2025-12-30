@@ -301,7 +301,7 @@ IAC Connector
 
 ### 1997 Jeep Wrangler 2.5L (TJ)
 
-- IAC valve is a 4-wire bipolar stepper motor wwith 90 degree connector
+- IAC valve is a 4-wire bipolar stepper motor with 90 degree connector
 - Located on the throttle body
 - PCM connector pinout: A1, A2, B1, B2
 - Normal idle position: ~20-40 steps from closed
@@ -383,15 +383,43 @@ Steps per second = 1000 / average_interval_ms
 Example: 8ms intervals = 125 steps/second
 ```
 
+## AI-Assisted Diagnostics
+
+For help interpreting log data and diagnosing idle problems, you can use an AI assistant (like ChatGPT, Claude, etc.) with the included context document.
+
+### How to Use
+
+1. Open `AI_DIAGNOSTIC_CONTEXT.md` and copy its entire contents
+2. Paste it into a new conversation with an AI assistant
+3. Upload or paste your CSV log file(s) from the tester
+4. Include any OBD-II scan data you have (screenshots or values work great)
+5. Describe your symptoms (high idle, rough idle, stalling, etc.)
+
+### What the AI Context Provides
+
+The `AI_DIAGNOSTIC_CONTEXT.md` file gives the AI assistant:
+
+- Complete technical specifications for the IAC system
+- CSV format explanation and column definitions
+- Step pattern interpretation guide
+- Common diagnostic scenarios and what to look for
+- Decision tree for troubleshooting
+- Normal OBD-II parameter ranges
+- Tips for correlating log data with sensor readings
+
+This allows the AI to provide informed diagnostic guidance similar to working with an experienced technician.
+
 ## Project Structure
 
 ```
 iac_tester/
-├── iac_tester.ino       # Main Arduino sketch
-├── circuit_diagram.svg  # Wiring diagram
-├── README.md            # This file
-├── LICENSE              # MIT License
-└── preview.html         # Standalone web interface preview
+├── iac_tester            # Arduino Folder
+| └─ iac_tester.ino            # Main Arduino sketch
+├── circuit_diagram.svg       # Wiring diagram
+├── README.md                 # This file
+├── LICENSE                   # MIT License
+├── AI_DIAGNOSTIC_CONTEXT.md  # AI assistant reference for diagnostics
+└── preview.html              # Standalone web interface preview
 ```
 
 ## Contributing
