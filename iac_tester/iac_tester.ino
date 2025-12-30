@@ -21,6 +21,8 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
+#include <ArduinoOTA.h>
+#include <Adafruit_NeoPixel.h>
 
 // ============================================
 // FORWARD DECLARATIONS
@@ -30,18 +32,26 @@ void executeStep();
 void enableMotor();
 void disableMotor();
 void monitorPcmSignals();
+void IRAM_ATTR pcmPinChangeISR();
 void handleRoot();
 void handleStatus();
 void handleMove();
 void handleStop();
 void handleSettings();
 void handleLogClear();
+void handleLogDownload();
+void handleLogStatus();
 void handleReset();
 void handleWifiSettings();
 void handleWifiScan();
 void handleWifiSave();
+void handlePinSettings();
+void handlePinSave();
+void handlePinAutoConfig();
 void loadWifiSettings();
 void saveWifiSettings();
+void loadPinSettings();
+void savePinSettings();
 void setupWifi();
 
 // ============================================
@@ -64,21 +74,76 @@ String wifiStaPassword = DEFAULT_STA_PASSWORD;
 String wifiHostname = DEFAULT_HOSTNAME;
 
 // ============================================
-// PIN DEFINITIONS - ESP32-S3-WROOM-1
+// PIN CONFIGURATION (loaded from NVS)
 // ============================================
+// Default pin assignments
+#define DEFAULT_PIN_AIN1 7
+#define DEFAULT_PIN_AIN2 15
+#define DEFAULT_PIN_BIN1 6
+#define DEFAULT_PIN_BIN2 5
+#define DEFAULT_PIN_STBY 18
+#define DEFAULT_PIN_PCM_A1 16
+#define DEFAULT_PIN_PCM_A2 17
+#define DEFAULT_PIN_PCM_B1 8
+#define DEFAULT_PIN_PCM_B2 3
 
-// TB6612FNG Motor Driver Pins
-const int PIN_AIN1 = 5;
-const int PIN_AIN2 = 6;
-const int PIN_BIN1 = 7;
-const int PIN_BIN2 = 15;
-const int PIN_STBY = 16;
+// Configurable pin assignments
+int PIN_AIN1 = DEFAULT_PIN_AIN1;
+int PIN_AIN2 = DEFAULT_PIN_AIN2;
+int PIN_BIN1 = DEFAULT_PIN_BIN1;
+int PIN_BIN2 = DEFAULT_PIN_BIN2;
+int PIN_STBY = DEFAULT_PIN_STBY;
+int PIN_PCM_A1 = DEFAULT_PIN_PCM_A1;
+int PIN_PCM_A2 = DEFAULT_PIN_PCM_A2;
+int PIN_PCM_B1 = DEFAULT_PIN_PCM_B1;
+int PIN_PCM_B2 = DEFAULT_PIN_PCM_B2;
 
-// PC817 Optocoupler Inputs (monitoring PCM signals)
-const int PIN_PCM_A1 = 17;
-const int PIN_PCM_A2 = 18;
-const int PIN_PCM_B1 = 8;
-const int PIN_PCM_B2 = 3;
+// ============================================
+// STATUS LED CONFIGURATION
+// ============================================
+// ESP32-S3 typically has WS2812 RGB LED on GPIO48
+// Set to 0 to use simple digitalWrite LED instead
+#define DEFAULT_PIN_STATUS_LED 48
+#define NEOPIXEL_COUNT 1
+
+// Configurable LED pin
+int PIN_STATUS_LED = DEFAULT_PIN_STATUS_LED;
+
+// NeoPixel for RGB LED (most ESP32-S3 boards)
+Adafruit_NeoPixel statusLed(NEOPIXEL_COUNT, DEFAULT_PIN_STATUS_LED, NEO_GRB + NEO_KHZ800);
+bool useNeoPixel = true;  // Set false if using simple LED
+
+// LED Colors (RGB)
+#define COLOR_OFF       statusLed.Color(0, 0, 0)
+#define COLOR_CONNECTING statusLed.Color(255, 50, 0)    // Orange - trying to connect
+#define COLOR_AP_MODE   statusLed.Color(0, 0, 255)      // Blue - AP mode active
+#define COLOR_CONNECTED statusLed.Color(0, 255, 0)      // Green - connected to WiFi
+
+// ============================================
+// ANALOG INPUT CONFIGURATION (Sensor Monitoring)
+// ============================================
+// TPS monitoring - uses voltage divider (10K/20K) to scale 0-5V to 0-3.3V
+// Use ADC1 pins only (GPIO1-10) - ADC2 conflicts with WiFi
+#define DEFAULT_PIN_TPS_INPUT 4
+
+int PIN_TPS_INPUT = DEFAULT_PIN_TPS_INPUT;
+
+// Calibration: Voltage divider ratio (R2 / (R1 + R2))
+// With 10K top (R1) and 20K bottom (R2): 20/(10+20) = 0.667
+const float TPS_DIVIDER_RATIO = 0.667;
+const float TPS_VREF = 3.3;  // ESP32 ADC reference
+
+// TPS readings
+float tpsVoltage = 0.0;
+float tpsPercent = 0.0;
+unsigned long lastTpsRead = 0;
+const int TPS_READ_INTERVAL = 100;  // Read every 100ms
+
+// WiFi status for LED blinking
+enum WifiStatus { WIFI_CONNECTING, WIFI_AP_MODE, WIFI_CONNECTED };
+WifiStatus wifiStatus = WIFI_CONNECTING;
+unsigned long lastLedToggle = 0;
+bool ledState = false;
 
 // ============================================
 // STEPPER MOTOR CONFIGURATION
@@ -103,7 +168,7 @@ volatile unsigned long lastStepTime = 0;
 volatile int totalStepsTaken = 0;
 
 // ============================================
-// PCM SIGNAL LOGGING
+// PCM SIGNAL LOGGING (High-Speed Interrupt-Driven)
 // ============================================
 
 struct SignalLog {
@@ -115,12 +180,20 @@ struct SignalLog {
   uint8_t iacActive : 1;
 };
 
-const int LOG_BUFFER_SIZE = 500;
+// Circular buffer - 10,000 entries = ~50KB RAM
+// At 8ms per step, holds ~80 seconds of active stepping
+const int LOG_BUFFER_SIZE = 10000;
 SignalLog signalLog[LOG_BUFFER_SIZE];
-volatile int logIndex = 0;
-volatile int logCount = 0;
+volatile int logHead = 0;      // Next write position
+volatile int logTail = 0;      // Oldest data position
+volatile int logCount = 0;     // Current entry count
+volatile bool logOverflow = false;  // True if we've wrapped around
 
 volatile uint8_t prevPcmState = 0;
+volatile uint8_t currentPcmState = 0;
+
+// Interrupt flag - set by ISR, processed in loop
+volatile bool pcmStateChanged = false;
 
 // PCM direction detection
 volatile int pcmStepIndex = -1;
@@ -252,6 +325,8 @@ const char index_html[] PROGMEM = R"rawliteral(
     .form-group { margin: 15px 0; }
     .form-group label { display: block; margin-bottom: 5px; color: #aaa; }
     .form-group input { width: 100%; padding: 10px; border-radius: 5px; border: 1px solid #444; background: #1a1a2e; color: #eee; font-size: 1em; }
+    .form-group select { width: 100%; padding: 10px; border-radius: 5px; border: 1px solid #444; background: #1a1a2e; color: #eee; font-size: 1em; }
+    .pin-select { font-family: monospace; }
     .current-wifi { padding: 15px; background: #1f4068; border-radius: 5px; margin-bottom: 15px; }
     .current-wifi .label { color: #aaa; font-size: 0.9em; }
     .current-wifi .value { font-size: 1.2em; color: #2ecc71; }
@@ -264,7 +339,8 @@ const char index_html[] PROGMEM = R"rawliteral(
   <!-- Tab Navigation -->
   <div class="tab-container">
     <button class="tab active" onclick="showTab('control')">Control</button>
-    <button class="tab" onclick="showTab('settings')">WiFi Settings</button>
+    <button class="tab" onclick="showTab('wifi')">WiFi</button>
+    <button class="tab" onclick="showTab('hardware')">Hardware</button>
   </div>
   
   <!-- Control Tab -->
@@ -272,12 +348,12 @@ const char index_html[] PROGMEM = R"rawliteral(
     <div class="card">
       <h2>Motor Control</h2>
       <div class="direction-btns">
-        <button class="btn btn-extend" id="btnExtend" 
-          onmousedown="startMove(1)" onmouseup="stopMove()" 
-          ontouchstart="startMove(1); event.preventDefault();" ontouchend="stopMove()">&#9650; EXTEND</button>
         <button class="btn btn-retract" id="btnRetract"
           onmousedown="startMove(-1)" onmouseup="stopMove()"
           ontouchstart="startMove(-1); event.preventDefault();" ontouchend="stopMove()">&#9660; RETRACT</button>
+        <button class="btn btn-extend" id="btnExtend" 
+          onmousedown="startMove(1)" onmouseup="stopMove()" 
+          ontouchstart="startMove(1); event.preventDefault();" ontouchend="stopMove()">&#9650; EXTEND</button>
       </div>
       <div class="step-btns">
         <button class="btn btn-step" onclick="moveSteps(-100)">-100</button>
@@ -294,54 +370,64 @@ const char index_html[] PROGMEM = R"rawliteral(
       <div class="led-panel">
         <div class="led-sections">
           <div>
-            <h3>Motor Outputs (GPIO → TB6612)</h3>
+            <h3>Motor Outputs (GPIO &#8594; TB6612)</h3>
             <div class="led-row">
               <div class="led off" id="ledAIN1"></div>
-              <div class="led-label"><span class="pin">GPIO5</span> AIN1<span class="desc">Coil A+</span></div>
+              <div class="led-label"><span class="pin" id="pinAIN1">GPIO?</span> AIN1<span class="desc">Coil A+</span></div>
               <div class="led-state low" id="stateAIN1">LOW</div>
             </div>
             <div class="led-row">
               <div class="led off" id="ledAIN2"></div>
-              <div class="led-label"><span class="pin">GPIO6</span> AIN2<span class="desc">Coil A-</span></div>
+              <div class="led-label"><span class="pin" id="pinAIN2">GPIO?</span> AIN2<span class="desc">Coil A-</span></div>
               <div class="led-state low" id="stateAIN2">LOW</div>
             </div>
             <div class="led-row">
               <div class="led off" id="ledBIN1"></div>
-              <div class="led-label"><span class="pin">GPIO7</span> BIN1<span class="desc">Coil B+</span></div>
+              <div class="led-label"><span class="pin" id="pinBIN1">GPIO?</span> BIN1<span class="desc">Coil B+</span></div>
               <div class="led-state low" id="stateBIN1">LOW</div>
             </div>
             <div class="led-row">
               <div class="led off" id="ledBIN2"></div>
-              <div class="led-label"><span class="pin">GPIO15</span> BIN2<span class="desc">Coil B-</span></div>
+              <div class="led-label"><span class="pin" id="pinBIN2">GPIO?</span> BIN2<span class="desc">Coil B-</span></div>
               <div class="led-state low" id="stateBIN2">LOW</div>
             </div>
             <div class="led-row">
               <div class="led off" id="ledSTBY"></div>
-              <div class="led-label"><span class="pin">GPIO16</span> STBY<span class="desc">Enable</span></div>
+              <div class="led-label"><span class="pin" id="pinSTBY">GPIO?</span> STBY<span class="desc">Enable</span></div>
               <div class="led-state low" id="stateSTBY">LOW</div>
             </div>
           </div>
           <div>
-            <h3>PCM Inputs (PC817 → GPIO)</h3>
+            <h3>PCM Inputs (PC817 &#8594; GPIO)</h3>
             <div class="led-row">
               <div class="led off" id="ledPCMA1"></div>
-              <div class="led-label"><span class="pin">GPIO17</span> PCM_A1<span class="desc">Coil A+</span></div>
+              <div class="led-label"><span class="pin" id="pinPCMA1">GPIO?</span> PCM_A1<span class="desc">Coil A+</span></div>
               <div class="led-state low" id="statePCMA1">LOW</div>
             </div>
             <div class="led-row">
               <div class="led off" id="ledPCMA2"></div>
-              <div class="led-label"><span class="pin">GPIO18</span> PCM_A2<span class="desc">Coil A-</span></div>
+              <div class="led-label"><span class="pin" id="pinPCMA2">GPIO?</span> PCM_A2<span class="desc">Coil A-</span></div>
               <div class="led-state low" id="statePCMA2">LOW</div>
             </div>
             <div class="led-row">
               <div class="led off" id="ledPCMB1"></div>
-              <div class="led-label"><span class="pin">GPIO8</span> PCM_B1<span class="desc">Coil B+</span></div>
+              <div class="led-label"><span class="pin" id="pinPCMB1">GPIO?</span> PCM_B1<span class="desc">Coil B+</span></div>
               <div class="led-state low" id="statePCMB1">LOW</div>
             </div>
             <div class="led-row">
               <div class="led off" id="ledPCMB2"></div>
-              <div class="led-label"><span class="pin">GPIO3</span> PCM_B2<span class="desc">Coil B-</span></div>
+              <div class="led-label"><span class="pin" id="pinPCMB2">GPIO?</span> PCM_B2<span class="desc">Coil B-</span></div>
               <div class="led-state low" id="statePCMB2">LOW</div>
+            </div>
+          </div>
+        </div>
+        <div class="led-sections" style="margin-top:15px">
+          <div>
+            <h3>Status LED</h3>
+            <div class="led-row">
+              <div class="led off" id="ledStatus"></div>
+              <div class="led-label"><span class="pin" id="pinStatus">GPIO?</span> STATUS<span class="desc">WiFi Indicator</span></div>
+              <div class="led-state low" id="stateStatus">LOW</div>
             </div>
           </div>
         </div>
@@ -389,18 +475,23 @@ const char index_html[] PROGMEM = R"rawliteral(
     </div>
     
     <div class="card">
-      <h2>Signal Log</h2>
+      <h2>High-Speed Signal Log</h2>
+      <div class="status-grid" style="margin-bottom:10px">
+        <div class="status-item"><div class="label">Buffer</div><div class="value"><span id="logCount">0</span> / <span id="logCapacity">10000</span></div></div>
+        <div class="status-item"><div class="label">Status</div><div class="value" id="logStatus">Ready</div></div>
+      </div>
       <div id="logArea" class="log-area"></div>
       <div style="margin-top:10px">
-        <button class="btn btn-secondary" onclick="clearLog()">Clear</button>
-        <button class="btn btn-secondary" onclick="downloadLog()">Download CSV</button>
-        <button class="btn btn-secondary" id="pauseBtn" onclick="togglePause()">Pause</button>
+        <button class="btn btn-secondary" onclick="clearLog()">Clear Buffer</button>
+        <button class="btn btn-secondary" onclick="downloadFullLog()">Download Full Log (CSV)</button>
+        <button class="btn btn-secondary" id="pauseBtn" onclick="togglePause()">Pause Display</button>
       </div>
+      <p class="note" style="margin-top:5px">Interrupt-driven logging captures every state change. Buffer overwrites oldest data when full.</p>
     </div>
   </div>
   
-  <!-- WiFi Settings Tab -->
-  <div id="settings-tab" class="tab-content">
+  <!-- WiFi Tab -->
+  <div id="wifi-tab" class="tab-content">
     <div class="card">
       <h2>Current Connection</h2>
       <div class="current-wifi">
@@ -459,7 +550,79 @@ const char index_html[] PROGMEM = R"rawliteral(
       <div style="margin-top:20px">
         <button class="btn btn-save" onclick="saveWifiSettings()">Save &amp; Restart</button>
       </div>
-      <p class="note">⚠ Device will restart after saving. Reconnect to the new network.</p>
+      <p class="note">&#9888; Device will restart after saving. Reconnect to the new network.</p>
+    </div>
+  </div>
+  
+  <!-- Hardware Tab -->
+  <div id="hardware-tab" class="tab-content">
+    <div class="card">
+      <h2>Auto-Configure Pins</h2>
+      <p class="note" style="margin-bottom:15px">With system wired in loopback mode (TB6612 outputs &#8594; PC817 inputs), this will automatically detect which input corresponds to each output.</p>
+      <button class="btn btn-scan" onclick="autoConfigurePins()" id="btnAutoConfig">Auto-Configure Input Pins</button>
+      <div id="autoConfigStatus" style="margin-top:15px; font-family:monospace; color:#888;"></div>
+    </div>
+    
+    <div class="card">
+      <h2>Pin Configuration</h2>
+      <p class="note" style="margin-bottom:15px">GPIO pin assignments for ESP32-S3. Changes require restart.</p>
+      
+      <div class="led-sections">
+        <div>
+          <h3>Motor Outputs (TB6612)</h3>
+          <div class="form-group">
+            <label>AIN1 (Coil A+)</label>
+            <select id="cfgAIN1" class="pin-select"></select>
+          </div>
+          <div class="form-group">
+            <label>AIN2 (Coil A-)</label>
+            <select id="cfgAIN2" class="pin-select"></select>
+          </div>
+          <div class="form-group">
+            <label>BIN1 (Coil B+)</label>
+            <select id="cfgBIN1" class="pin-select"></select>
+          </div>
+          <div class="form-group">
+            <label>BIN2 (Coil B-)</label>
+            <select id="cfgBIN2" class="pin-select"></select>
+          </div>
+          <div class="form-group">
+            <label>STBY (Enable)</label>
+            <select id="cfgSTBY" class="pin-select"></select>
+          </div>
+        </div>
+        <div>
+          <h3>PCM Inputs (PC817)</h3>
+          <div class="form-group">
+            <label>PCM_A1 (Coil A+)</label>
+            <select id="cfgPCMA1" class="pin-select"></select>
+          </div>
+          <div class="form-group">
+            <label>PCM_A2 (Coil A-)</label>
+            <select id="cfgPCMA2" class="pin-select"></select>
+          </div>
+          <div class="form-group">
+            <label>PCM_B1 (Coil B+)</label>
+            <select id="cfgPCMB1" class="pin-select"></select>
+          </div>
+          <div class="form-group">
+            <label>PCM_B2 (Coil B-)</label>
+            <select id="cfgPCMB2" class="pin-select"></select>
+          </div>
+        </div>
+      </div>
+      
+      <h3>Status LED</h3>
+      <div class="form-group" style="max-width:200px">
+        <label>LED Pin</label>
+        <select id="cfgLED" class="pin-select"></select>
+      </div>
+      <p class="note">Common ESP32-S3 LED pins: 2, 38, 48</p>
+      
+      <div style="margin-top:20px">
+        <button class="btn btn-save" onclick="savePinSettings()">Save Pins &amp; Restart</button>
+        <button class="btn btn-secondary" onclick="resetPinsToDefault()">Reset to Defaults</button>
+      </div>
     </div>
   </div>
   
@@ -475,9 +638,11 @@ const char index_html[] PROGMEM = R"rawliteral(
     function showTab(tab) {
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
       document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-      document.querySelector(`.tab:nth-child(${tab === 'control' ? 1 : 2})`).classList.add('active');
+      const tabIndex = tab === 'control' ? 1 : tab === 'wifi' ? 2 : 3;
+      document.querySelector(`.tab:nth-child(${tabIndex})`).classList.add('active');
       document.getElementById(tab + '-tab').classList.add('active');
-      if (tab === 'settings') loadWifiSettings();
+      if (tab === 'wifi') loadWifiSettings();
+      if (tab === 'hardware') loadPinSettings();
     }
     
     // Initialize chart
@@ -561,12 +726,13 @@ const char index_html[] PROGMEM = R"rawliteral(
     function clearLog() { 
       fetch('/api/log/clear'); 
       logEntries = [];
-      document.getElementById('logArea').innerHTML = ''; 
+      document.getElementById('logArea').innerHTML = '';
+      updateLogStatus();
     }
     
     function togglePause() {
       isPaused = !isPaused;
-      document.getElementById('pauseBtn').textContent = isPaused ? 'Resume' : 'Pause';
+      document.getElementById('pauseBtn').textContent = isPaused ? 'Resume Display' : 'Pause Display';
     }
     
     // Update LED indicator panel
@@ -619,6 +785,23 @@ const char index_html[] PROGMEM = R"rawliteral(
           }
         }
       });
+      
+      // Status LED (yellow when HIGH)
+      const statusLed = document.getElementById('ledStatus');
+      const statusState = document.getElementById('stateStatus');
+      const statusPin = document.getElementById('pinStatus');
+      if (statusLed && statusState) {
+        if (data.ledState) {
+          statusLed.className = 'led on-yellow';
+          statusState.textContent = 'HIGH';
+          statusState.className = 'led-state high';
+        } else {
+          statusLed.className = 'led off';
+          statusState.textContent = 'LOW';
+          statusState.className = 'led-state low';
+        }
+        if (statusPin) statusPin.textContent = 'GPIO' + data.ledPin;
+      }
       
       // Activity LED
       const actLed = document.getElementById('activityLed');
@@ -736,7 +919,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             list.innerHTML = data.networks.map(n => 
               '<div class="network-item" onclick="selectNetwork(\'' + n.ssid.replace(/'/g, "\\'") + '\')">' +
               '<span class="ssid">' + n.ssid + '</span>' +
-              '<span class="signal">' + n.rssi + ' dBm' + (n.secure ? ' 🔒' : '') + '</span></div>'
+              '<span class="signal">' + n.rssi + ' dBm' + (n.secure ? ' &#128274;' : '') + '</span></div>'
             ).join('');
           }
         })
@@ -791,6 +974,162 @@ const char index_html[] PROGMEM = R"rawliteral(
       .catch(() => alert('Failed to save settings'));
     }
     
+    // Pin Settings Functions
+    
+    // ESP32-S3 GPIO pins suitable for OUTPUT (motor driver)
+    // Excludes: 0 (boot), 19-20 (USB), 22-25 (flash), 26-32 (PSRAM), 43-44 (UART), 46 (input-only)
+    const OUTPUT_PINS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 35, 36, 37, 38, 39, 40, 41, 42, 45, 47, 48];
+    
+    // ESP32-S3 GPIO pins suitable for INPUT with pull-up (PCM monitoring)
+    // Same as outputs, all support INPUT_PULLUP
+    const INPUT_PINS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 35, 36, 37, 38, 39, 40, 41, 42, 45, 47, 48];
+    
+    // Default pin assignments
+    const DEFAULT_PINS = {
+      ain1: 7, ain2: 15, bin1: 6, bin2: 5, stby: 18,
+      pcmA1: 16, pcmA2: 17, pcmB1: 8, pcmB2: 3,
+      led: 2
+    };
+    
+    function populatePinDropdowns() {
+      const outputSelects = ['cfgAIN1', 'cfgAIN2', 'cfgBIN1', 'cfgBIN2', 'cfgSTBY', 'cfgLED'];
+      const inputSelects = ['cfgPCMA1', 'cfgPCMA2', 'cfgPCMB1', 'cfgPCMB2'];
+      
+      outputSelects.forEach(id => {
+        const select = document.getElementById(id);
+        select.innerHTML = OUTPUT_PINS.map(p => 
+          '<option value="' + p + '">GPIO ' + p + '</option>'
+        ).join('');
+      });
+      
+      inputSelects.forEach(id => {
+        const select = document.getElementById(id);
+        select.innerHTML = INPUT_PINS.map(p => 
+          '<option value="' + p + '">GPIO ' + p + '</option>'
+        ).join('');
+      });
+    }
+    
+    function loadPinSettings() {
+      // First populate dropdowns
+      populatePinDropdowns();
+      
+      fetch('/api/pins')
+        .then(r => r.json())
+        .then(data => {
+          // Update LED panel labels
+          document.getElementById('pinAIN1').textContent = 'GPIO' + data.ain1;
+          document.getElementById('pinAIN2').textContent = 'GPIO' + data.ain2;
+          document.getElementById('pinBIN1').textContent = 'GPIO' + data.bin1;
+          document.getElementById('pinBIN2').textContent = 'GPIO' + data.bin2;
+          document.getElementById('pinSTBY').textContent = 'GPIO' + data.stby;
+          document.getElementById('pinPCMA1').textContent = 'GPIO' + data.pcmA1;
+          document.getElementById('pinPCMA2').textContent = 'GPIO' + data.pcmA2;
+          document.getElementById('pinPCMB1').textContent = 'GPIO' + data.pcmB1;
+          document.getElementById('pinPCMB2').textContent = 'GPIO' + data.pcmB2;
+          
+          // Update config form dropdowns
+          document.getElementById('cfgAIN1').value = data.ain1;
+          document.getElementById('cfgAIN2').value = data.ain2;
+          document.getElementById('cfgBIN1').value = data.bin1;
+          document.getElementById('cfgBIN2').value = data.bin2;
+          document.getElementById('cfgSTBY').value = data.stby;
+          document.getElementById('cfgPCMA1').value = data.pcmA1;
+          document.getElementById('cfgPCMA2').value = data.pcmA2;
+          document.getElementById('cfgPCMB1').value = data.pcmB1;
+          document.getElementById('cfgPCMB2').value = data.pcmB2;
+          document.getElementById('cfgLED').value = data.led;
+        });
+    }
+    
+    function savePinSettings() {
+      const pins = {
+        ain1: parseInt(document.getElementById('cfgAIN1').value),
+        ain2: parseInt(document.getElementById('cfgAIN2').value),
+        bin1: parseInt(document.getElementById('cfgBIN1').value),
+        bin2: parseInt(document.getElementById('cfgBIN2').value),
+        stby: parseInt(document.getElementById('cfgSTBY').value),
+        pcmA1: parseInt(document.getElementById('cfgPCMA1').value),
+        pcmA2: parseInt(document.getElementById('cfgPCMA2').value),
+        pcmB1: parseInt(document.getElementById('cfgPCMB1').value),
+        pcmB2: parseInt(document.getElementById('cfgPCMB2').value),
+        led: parseInt(document.getElementById('cfgLED').value)
+      };
+      
+      // Check for duplicate pins (LED can share with others since it's just an indicator)
+      const motorPins = [pins.ain1, pins.ain2, pins.bin1, pins.bin2, pins.stby, pins.pcmA1, pins.pcmA2, pins.pcmB1, pins.pcmB2];
+      const uniquePins = new Set(motorPins);
+      if (uniquePins.size !== motorPins.length) {
+        alert('Error: Each pin must be unique! You have duplicate GPIO assignments.');
+        return;
+      }
+      
+      fetch('/api/pins/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(pins)
+      })
+      .then(r => r.json())
+      .then(data => {
+        if (data.success) {
+          alert('Pin settings saved! Device will restart...');
+        } else {
+          alert('Error: ' + data.error);
+        }
+      })
+      .catch(() => alert('Failed to save pin settings'));
+    }
+    
+    function resetPinsToDefault() {
+      if (confirm('Reset all pins to default values?')) {
+        document.getElementById('cfgAIN1').value = DEFAULT_PINS.ain1;
+        document.getElementById('cfgAIN2').value = DEFAULT_PINS.ain2;
+        document.getElementById('cfgBIN1').value = DEFAULT_PINS.bin1;
+        document.getElementById('cfgBIN2').value = DEFAULT_PINS.bin2;
+        document.getElementById('cfgSTBY').value = DEFAULT_PINS.stby;
+        document.getElementById('cfgPCMA1').value = DEFAULT_PINS.pcmA1;
+        document.getElementById('cfgPCMA2').value = DEFAULT_PINS.pcmA2;
+        document.getElementById('cfgPCMB1').value = DEFAULT_PINS.pcmB1;
+        document.getElementById('cfgPCMB2').value = DEFAULT_PINS.pcmB2;
+        document.getElementById('cfgLED').value = DEFAULT_PINS.led;
+      }
+    }
+    
+    async function autoConfigurePins() {
+      const status = document.getElementById('autoConfigStatus');
+      const btn = document.getElementById('btnAutoConfig');
+      btn.disabled = true;
+      status.innerHTML = 'Starting auto-configuration...<br>Make sure system is wired in loopback mode!';
+      
+      try {
+        const response = await fetch('/api/pins/autoconfig');
+        const data = await response.json();
+        
+        if (data.success) {
+          status.innerHTML = '<span style="color:#22c55e">Auto-configuration complete!</span><br>' +
+            'AIN1 &#8594; GPIO' + data.pcmA1 + '<br>' +
+            'AIN2 &#8594; GPIO' + data.pcmA2 + '<br>' +
+            'BIN1 &#8594; GPIO' + data.pcmB1 + '<br>' +
+            'BIN2 &#8594; GPIO' + data.pcmB2 + '<br>' +
+            '<br>Click "Save Pins &amp; Restart" to apply.';
+          
+          // Update the dropdowns
+          document.getElementById('cfgPCMA1').value = data.pcmA1;
+          document.getElementById('cfgPCMA2').value = data.pcmA2;
+          document.getElementById('cfgPCMB1').value = data.pcmB1;
+          document.getElementById('cfgPCMB2').value = data.pcmB2;
+        } else {
+          status.innerHTML = '<span style="color:#ef4444">Auto-configuration failed!</span><br>' + 
+            (data.error || 'Unknown error') + '<br>' +
+            'Check wiring and try again.';
+        }
+      } catch (err) {
+        status.innerHTML = '<span style="color:#ef4444">Error: ' + err.message + '</span>';
+      }
+      
+      btn.disabled = false;
+    }
+    
     function downloadLog() {
       let csv = 'timestamp,pcmA1,pcmA2,pcmB1,pcmB2,iacActive\n';
       logEntries.forEach(e => {
@@ -805,8 +1144,38 @@ const char index_html[] PROGMEM = R"rawliteral(
       URL.revokeObjectURL(url);
     }
     
+    function downloadFullLog() {
+      // Download full high-speed log from device
+      window.location.href = '/api/log/download';
+    }
+    
+    function updateLogStatus() {
+      fetch('/api/log/status')
+        .then(r => r.json())
+        .then(data => {
+          document.getElementById('logCount').textContent = data.count;
+          document.getElementById('logCapacity').textContent = data.capacity;
+          const statusEl = document.getElementById('logStatus');
+          if (data.overflow) {
+            statusEl.textContent = 'Overflow (oldest overwritten)';
+            statusEl.style.color = '#f39c12';
+          } else if (data.count > 0) {
+            statusEl.textContent = data.percentFull + '% full';
+            statusEl.style.color = '#22c55e';
+          } else {
+            statusEl.textContent = 'Ready';
+            statusEl.style.color = '#888';
+          }
+        });
+    }
+    
+    // Update log status periodically
+  setInterval(updateLogStatus, 2000);
+    
     // Initialize
     initChart();
+    loadPinSettings();
+    updateLogStatus();
     pollStatus();
   </script>
 </body>
@@ -846,6 +1215,46 @@ void saveWifiSettings() {
   Serial.println("WiFi settings saved");
 }
 
+void loadPinSettings() {
+  preferences.begin("pins", true);  // Read-only
+  PIN_AIN1 = preferences.getInt("ain1", DEFAULT_PIN_AIN1);
+  PIN_AIN2 = preferences.getInt("ain2", DEFAULT_PIN_AIN2);
+  PIN_BIN1 = preferences.getInt("bin1", DEFAULT_PIN_BIN1);
+  PIN_BIN2 = preferences.getInt("bin2", DEFAULT_PIN_BIN2);
+  PIN_STBY = preferences.getInt("stby", DEFAULT_PIN_STBY);
+  PIN_PCM_A1 = preferences.getInt("pcmA1", DEFAULT_PIN_PCM_A1);
+  PIN_PCM_A2 = preferences.getInt("pcmA2", DEFAULT_PIN_PCM_A2);
+  PIN_PCM_B1 = preferences.getInt("pcmB1", DEFAULT_PIN_PCM_B1);
+  PIN_PCM_B2 = preferences.getInt("pcmB2", DEFAULT_PIN_PCM_B2);
+  PIN_STATUS_LED = preferences.getInt("led", DEFAULT_PIN_STATUS_LED);
+  PIN_TPS_INPUT = preferences.getInt("tps", DEFAULT_PIN_TPS_INPUT);
+  preferences.end();
+  
+  Serial.println("Pin settings loaded:");
+  Serial.printf("  Motor: AIN1=%d AIN2=%d BIN1=%d BIN2=%d STBY=%d\n", 
+    PIN_AIN1, PIN_AIN2, PIN_BIN1, PIN_BIN2, PIN_STBY);
+  Serial.printf("  PCM: A1=%d A2=%d B1=%d B2=%d\n",
+    PIN_PCM_A1, PIN_PCM_A2, PIN_PCM_B1, PIN_PCM_B2);
+  Serial.printf("  LED: %d  TPS: %d\n", PIN_STATUS_LED, PIN_TPS_INPUT);
+}
+
+void savePinSettings() {
+  preferences.begin("pins", false);  // Read-write
+  preferences.putInt("ain1", PIN_AIN1);
+  preferences.putInt("ain2", PIN_AIN2);
+  preferences.putInt("bin1", PIN_BIN1);
+  preferences.putInt("bin2", PIN_BIN2);
+  preferences.putInt("stby", PIN_STBY);
+  preferences.putInt("pcmA1", PIN_PCM_A1);
+  preferences.putInt("pcmA2", PIN_PCM_A2);
+  preferences.putInt("pcmB1", PIN_PCM_B1);
+  preferences.putInt("pcmB2", PIN_PCM_B2);
+  preferences.putInt("led", PIN_STATUS_LED);
+  preferences.putInt("tps", PIN_TPS_INPUT);
+  preferences.end();
+  Serial.println("Pin settings saved");
+}
+
 void setupWifi() {
   // Set hostname before starting WiFi
   WiFi.setHostname(wifiHostname.c_str());
@@ -854,6 +1263,7 @@ void setupWifi() {
     // Access Point mode
     WiFi.mode(WIFI_AP);
     WiFi.softAP(wifiApSsid.c_str(), wifiApPassword.c_str());
+    wifiStatus = WIFI_AP_MODE;
     Serial.println("\n=== Access Point Mode ===");
     Serial.println("SSID: " + wifiApSsid);
     Serial.println("Password: " + wifiApPassword);
@@ -862,18 +1272,27 @@ void setupWifi() {
     Serial.println("========================\n");
   } else {
     // Station mode - connect to network
+    wifiStatus = WIFI_CONNECTING;
     WiFi.mode(WIFI_STA);
     WiFi.begin(wifiStaSsid.c_str(), wifiStaPassword.c_str());
     Serial.print("Connecting to " + wifiStaSsid);
     
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-      delay(500);
-      Serial.print(".");
+      delay(100);
+      // Fast blink during connection (orange)
+      if (useNeoPixel) {
+        statusLed.setPixelColor(0, (attempts % 2) ? COLOR_CONNECTING : COLOR_OFF);
+        statusLed.show();
+      } else {
+        digitalWrite(PIN_STATUS_LED, (attempts % 2) ? HIGH : LOW);
+      }
+      if (attempts % 5 == 0) Serial.print(".");
       attempts++;
     }
     
     if (WiFi.status() == WL_CONNECTED) {
+      wifiStatus = WIFI_CONNECTED;
       Serial.println("\n=== Connected to WiFi ===");
       Serial.println("SSID: " + wifiStaSsid);
       Serial.println("IP Address: " + WiFi.localIP().toString());
@@ -883,6 +1302,7 @@ void setupWifi() {
       Serial.println("\nFailed to connect! Starting AP mode as fallback...");
       WiFi.mode(WIFI_AP);
       WiFi.softAP(wifiApSsid.c_str(), wifiApPassword.c_str());
+      wifiStatus = WIFI_AP_MODE;
       Serial.println("Fallback AP - SSID: " + wifiApSsid);
       Serial.println("Password: " + wifiApPassword);
       Serial.println("IP: " + WiFi.softAPIP().toString());
@@ -896,6 +1316,42 @@ void setupWifi() {
   } else {
     Serial.println("mDNS failed to start");
   }
+  
+  // Setup OTA updates
+  ArduinoOTA.setHostname(wifiHostname.c_str());
+  ArduinoOTA.setPassword("iac1997");  // OTA password
+  
+  ArduinoOTA.onStart([]() {
+    String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
+    Serial.println("OTA Start: " + type);
+  });
+  
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nOTA End");
+  });
+  
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("OTA Progress: %u%%\r", (progress / (total / 100)));
+    // Fast blink purple during OTA
+    if (useNeoPixel) {
+      statusLed.setPixelColor(0, (progress % 2) ? statusLed.Color(128, 0, 255) : COLOR_OFF);
+      statusLed.show();
+    } else {
+      digitalWrite(PIN_STATUS_LED, (progress % 2) ? HIGH : LOW);
+    }
+  });
+  
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  
+  ArduinoOTA.begin();
+  Serial.println("OTA Updates enabled (password: iac1997)");
 }
 
 // ============================================
@@ -939,6 +1395,7 @@ void handleStatus() {
       rawA1, rawA2, rawB1, rawB2, !rawA1, !rawA2, !rawB1, !rawB2);
     Serial.printf("DEBUG Motor Out: AIN1=%d AIN2=%d BIN1=%d BIN2=%d STBY=%d\n",
       ain1, ain2, bin1, bin2, stby);
+    Serial.printf("DEBUG Status LED: GPIO%d = %s\n", PIN_STATUS_LED, ledState ? "HIGH" : "LOW");
     lastDebug = millis();
   }
   
@@ -948,18 +1405,35 @@ void handleStatus() {
   doc["pcmB1"] = !rawB1;
   doc["pcmB2"] = !rawB2;
   
+  // Status LED state
+  doc["ledPin"] = PIN_STATUS_LED;
+  doc["ledState"] = ledState ? 1 : 0;
+  
   // Direction
   doc["youDir"] = isMoving ? stepDirection : 0;
   doc["pcmDir"] = pcmDirection;
   doc["youPos"] = youStepPosition;
   doc["pcmPos"] = pcmStepPosition;
   
-  // Recent log entries
+  // Recent log entries for live display (last 10 entries)
   JsonArray logArray = doc["log"].to<JsonArray>();
-  static int lastSentLog = 0;
-  int entriesToSend = min(10, logCount - lastSentLog);
+  static int lastSentHead = 0;
+  
+  // Calculate how many new entries since last poll
+  int newEntries = 0;
+  if (logHead >= lastSentHead) {
+    newEntries = logHead - lastSentHead;
+  } else {
+    // Buffer wrapped
+    newEntries = (LOG_BUFFER_SIZE - lastSentHead) + logHead;
+  }
+  
+  // Send up to 10 of the most recent new entries
+  int entriesToSend = min(10, newEntries);
+  int startIdx = (logHead - entriesToSend + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE;
+  
   for (int i = 0; i < entriesToSend; i++) {
-    int idx = (lastSentLog + i) % LOG_BUFFER_SIZE;
+    int idx = (startIdx + i) % LOG_BUFFER_SIZE;
     JsonObject entry = logArray.add<JsonObject>();
     entry["t"] = signalLog[idx].timestamp;
     entry["a1"] = signalLog[idx].pcmA1;
@@ -968,7 +1442,7 @@ void handleStatus() {
     entry["b2"] = signalLog[idx].pcmB2;
     entry["iac"] = signalLog[idx].iacActive;
   }
-  lastSentLog = logCount;
+  lastSentHead = logHead;
   
   String response;
   serializeJson(doc, response);
@@ -1013,9 +1487,62 @@ void handleSettings() {
 }
 
 void handleLogClear() {
-  logIndex = 0;
+  // Disable interrupts briefly to safely reset buffer
+  noInterrupts();
+  logHead = 0;
+  logTail = 0;
   logCount = 0;
+  logOverflow = false;
+  interrupts();
   server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleLogDownload() {
+  // Send entire log buffer as CSV
+  // Disable interrupts to get consistent snapshot
+  noInterrupts();
+  int count = logCount;
+  int tail = logTail;
+  bool overflow = logOverflow;
+  interrupts();
+  
+  // Build CSV response
+  String csv = "timestamp,pcmA1,pcmA2,pcmB1,pcmB2,iacActive\n";
+  
+  for (int i = 0; i < count; i++) {
+    int idx = (tail + i) % LOG_BUFFER_SIZE;
+    csv += String(signalLog[idx].timestamp) + ",";
+    csv += String(signalLog[idx].pcmA1) + ",";
+    csv += String(signalLog[idx].pcmA2) + ",";
+    csv += String(signalLog[idx].pcmB1) + ",";
+    csv += String(signalLog[idx].pcmB2) + ",";
+    csv += String(signalLog[idx].iacActive) + "\n";
+    
+    // Yield periodically to prevent watchdog timeout
+    if (i % 500 == 0) yield();
+  }
+  
+  // Add metadata header
+  String header = "# IAC Tester High-Speed Log\n";
+  header += "# Entries: " + String(count) + " / " + String(LOG_BUFFER_SIZE) + "\n";
+  header += "# Buffer overflow: " + String(overflow ? "YES (oldest data overwritten)" : "NO") + "\n";
+  header += "# Resolution: Interrupt-driven (microsecond accuracy)\n";
+  header += "#\n";
+  
+  server.sendHeader("Content-Disposition", "attachment; filename=iac_log.csv");
+  server.send(200, "text/csv", header + csv);
+}
+
+void handleLogStatus() {
+  JsonDocument doc;
+  doc["count"] = logCount;
+  doc["capacity"] = LOG_BUFFER_SIZE;
+  doc["overflow"] = logOverflow;
+  doc["percentFull"] = (logCount * 100) / LOG_BUFFER_SIZE;
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
 }
 
 void handleReset() {
@@ -1095,6 +1622,157 @@ void handleWifiSave() {
   }
 }
 
+void handlePinSettings() {
+  JsonDocument doc;
+  doc["ain1"] = PIN_AIN1;
+  doc["ain2"] = PIN_AIN2;
+  doc["bin1"] = PIN_BIN1;
+  doc["bin2"] = PIN_BIN2;
+  doc["stby"] = PIN_STBY;
+  doc["pcmA1"] = PIN_PCM_A1;
+  doc["pcmA2"] = PIN_PCM_A2;
+  doc["pcmB1"] = PIN_PCM_B1;
+  doc["pcmB2"] = PIN_PCM_B2;
+  doc["led"] = PIN_STATUS_LED;
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handlePinSave() {
+  if (server.hasArg("plain")) {
+    JsonDocument doc;
+    deserializeJson(doc, server.arg("plain"));
+    
+    PIN_AIN1 = doc["ain1"] | DEFAULT_PIN_AIN1;
+    PIN_AIN2 = doc["ain2"] | DEFAULT_PIN_AIN2;
+    PIN_BIN1 = doc["bin1"] | DEFAULT_PIN_BIN1;
+    PIN_BIN2 = doc["bin2"] | DEFAULT_PIN_BIN2;
+    PIN_STBY = doc["stby"] | DEFAULT_PIN_STBY;
+    PIN_PCM_A1 = doc["pcmA1"] | DEFAULT_PIN_PCM_A1;
+    PIN_PCM_A2 = doc["pcmA2"] | DEFAULT_PIN_PCM_A2;
+    PIN_PCM_B1 = doc["pcmB1"] | DEFAULT_PIN_PCM_B1;
+    PIN_PCM_B2 = doc["pcmB2"] | DEFAULT_PIN_PCM_B2;
+    PIN_STATUS_LED = doc["led"] | DEFAULT_PIN_STATUS_LED;
+    
+    savePinSettings();
+    
+    server.send(200, "application/json", "{\"success\":true}");
+    
+    // Restart after sending response
+    delay(1000);
+    ESP.restart();
+  } else {
+    server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
+  }
+}
+
+void handlePinAutoConfig() {
+  Serial.println("\n=== Auto-Configure Pins ===");
+  
+  // Get current input pins to test
+  int inputPins[4] = {PIN_PCM_A1, PIN_PCM_A2, PIN_PCM_B1, PIN_PCM_B2};
+  int outputPins[4] = {PIN_AIN1, PIN_AIN2, PIN_BIN1, PIN_BIN2};
+  const char* outputNames[4] = {"AIN1", "AIN2", "BIN1", "BIN2"};
+  
+  // Results: which input pin corresponds to each output
+  int detectedInputs[4] = {-1, -1, -1, -1};
+  
+  // Make sure all outputs are LOW first
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(outputPins[i], LOW);
+  }
+  
+  // Enable the motor driver
+  digitalWrite(PIN_STBY, HIGH);
+  delay(50);
+  
+  // Read baseline (all inputs should be HIGH due to pull-ups when outputs are LOW)
+  Serial.println("Baseline input states:");
+  for (int i = 0; i < 4; i++) {
+    Serial.printf("  Input pin %d: %s\n", inputPins[i], digitalRead(inputPins[i]) ? "HIGH" : "LOW");
+  }
+  
+  // Test each output one at a time
+  for (int outIdx = 0; outIdx < 4; outIdx++) {
+    Serial.printf("\nTesting %s (GPIO%d)...\n", outputNames[outIdx], outputPins[outIdx]);
+    
+    // Set this output HIGH
+    digitalWrite(outputPins[outIdx], HIGH);
+    delay(50);  // Give optocoupler time to respond
+    
+    // Check which input went LOW (optocoupler inverts)
+    int foundInput = -1;
+    for (int inIdx = 0; inIdx < 4; inIdx++) {
+      int state = digitalRead(inputPins[inIdx]);
+      Serial.printf("  Input GPIO%d: %s\n", inputPins[inIdx], state ? "HIGH" : "LOW");
+      if (state == LOW) {
+        foundInput = inputPins[inIdx];
+      }
+    }
+    
+    if (foundInput >= 0) {
+      detectedInputs[outIdx] = foundInput;
+      Serial.printf("  -> %s maps to GPIO%d\n", outputNames[outIdx], foundInput);
+    } else {
+      Serial.printf("  -> %s: No input detected!\n", outputNames[outIdx]);
+    }
+    
+    // Turn output back off
+    digitalWrite(outputPins[outIdx], LOW);
+    delay(50);
+  }
+  
+  // Disable motor driver
+  digitalWrite(PIN_STBY, LOW);
+  
+  // Check for errors
+  bool hasError = false;
+  String errorMsg = "";
+  
+  for (int i = 0; i < 4; i++) {
+    if (detectedInputs[i] < 0) {
+      hasError = true;
+      errorMsg = "No input detected for " + String(outputNames[i]);
+      break;
+    }
+  }
+  
+  // Check for duplicates
+  if (!hasError) {
+    for (int i = 0; i < 4; i++) {
+      for (int j = i + 1; j < 4; j++) {
+        if (detectedInputs[i] == detectedInputs[j]) {
+          hasError = true;
+          errorMsg = "Duplicate: " + String(outputNames[i]) + " and " + String(outputNames[j]) + " both detected GPIO" + String(detectedInputs[i]);
+          break;
+        }
+      }
+      if (hasError) break;
+    }
+  }
+  
+  // Send response
+  JsonDocument doc;
+  if (hasError) {
+    doc["success"] = false;
+    doc["error"] = errorMsg;
+  } else {
+    doc["success"] = true;
+    doc["pcmA1"] = detectedInputs[0];  // Input for AIN1
+    doc["pcmA2"] = detectedInputs[1];  // Input for AIN2
+    doc["pcmB1"] = detectedInputs[2];  // Input for BIN1
+    doc["pcmB2"] = detectedInputs[3];  // Input for BIN2
+  }
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+  
+  Serial.println("\n=== Auto-Configure Complete ===");
+}
+
 // ============================================
 // SETUP
 // ============================================
@@ -1104,6 +1782,10 @@ void setup() {
   Serial.println("\n\n================================");
   Serial.println("   IAC Valve Tester Starting");
   Serial.println("================================\n");
+  
+  // Load settings from NVS first
+  loadWifiSettings();
+  loadPinSettings();
   
   // Initialize motor driver pins
   pinMode(PIN_AIN1, OUTPUT);
@@ -1122,10 +1804,36 @@ void setup() {
   pinMode(PIN_PCM_B1, INPUT_PULLUP);
   pinMode(PIN_PCM_B2, INPUT_PULLUP);
   
-  // Load WiFi settings from NVS
-  loadWifiSettings();
+  // Read initial state
+  currentPcmState = 0;
+  currentPcmState |= (!digitalRead(PIN_PCM_A1)) << 0;
+  currentPcmState |= (!digitalRead(PIN_PCM_A2)) << 1;
+  currentPcmState |= (!digitalRead(PIN_PCM_B1)) << 2;
+  currentPcmState |= (!digitalRead(PIN_PCM_B2)) << 3;
+  prevPcmState = currentPcmState;
   
-  // Setup WiFi
+  // Attach interrupts for high-speed PCM logging
+  attachInterrupt(digitalPinToInterrupt(PIN_PCM_A1), pcmPinChangeISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_PCM_A2), pcmPinChangeISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_PCM_B1), pcmPinChangeISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_PCM_B2), pcmPinChangeISR, CHANGE);
+  Serial.println("PCM interrupts attached for high-speed logging");
+  
+  // Initialize status LED
+  if (useNeoPixel) {
+    statusLed.setPin(PIN_STATUS_LED);
+    statusLed.begin();
+    statusLed.setBrightness(50);  // 0-255, 50 is reasonable
+    statusLed.setPixelColor(0, COLOR_OFF);
+    statusLed.show();
+    Serial.printf("NeoPixel LED initialized on GPIO%d\n", PIN_STATUS_LED);
+  } else {
+    pinMode(PIN_STATUS_LED, OUTPUT);
+    digitalWrite(PIN_STATUS_LED, LOW);
+    Serial.printf("Simple LED initialized on GPIO%d\n", PIN_STATUS_LED);
+  }
+  
+  // Setup WiFi (and OTA)
   setupWifi();
   
   // Setup web server routes
@@ -1135,10 +1843,15 @@ void setup() {
   server.on("/api/stop", handleStop);
   server.on("/api/settings", handleSettings);
   server.on("/api/log/clear", handleLogClear);
+  server.on("/api/log/download", handleLogDownload);
+  server.on("/api/log/status", handleLogStatus);
   server.on("/api/reset", handleReset);
   server.on("/api/wifi/settings", handleWifiSettings);
   server.on("/api/wifi/scan", handleWifiScan);
   server.on("/api/wifi/save", HTTP_POST, handleWifiSave);
+  server.on("/api/pins", handlePinSettings);
+  server.on("/api/pins/save", HTTP_POST, handlePinSave);
+  server.on("/api/pins/autoconfig", handlePinAutoConfig);
   
   server.begin();
   Serial.println("Web server started on port 80");
@@ -1147,11 +1860,57 @@ void setup() {
 }
 
 // ============================================
+// STATUS LED UPDATE
+// ============================================
+
+void updateStatusLED() {
+  unsigned long now = millis();
+  unsigned long blinkInterval;
+  uint32_t color;
+  
+  switch (wifiStatus) {
+    case WIFI_CONNECTING:
+      blinkInterval = 100;  // Fast blink - 5Hz
+      color = COLOR_CONNECTING;  // Orange
+      break;
+    case WIFI_AP_MODE:
+      blinkInterval = 1000; // Slow blink - 0.5Hz
+      color = COLOR_AP_MODE;     // Blue
+      break;
+    case WIFI_CONNECTED:
+      // Solid green
+      ledState = true;
+      if (useNeoPixel) {
+        statusLed.setPixelColor(0, COLOR_CONNECTED);
+        statusLed.show();
+      } else {
+        digitalWrite(PIN_STATUS_LED, HIGH);
+      }
+      return;
+  }
+  
+  // Blinking logic
+  if (now - lastLedToggle >= blinkInterval) {
+    lastLedToggle = now;
+    ledState = !ledState;
+    
+    if (useNeoPixel) {
+      statusLed.setPixelColor(0, ledState ? color : COLOR_OFF);
+      statusLed.show();
+    } else {
+      digitalWrite(PIN_STATUS_LED, ledState ? HIGH : LOW);
+    }
+  }
+}
+
+// ============================================
 // MAIN LOOP
 // ============================================
 
 void loop() {
   server.handleClient();
+  ArduinoOTA.handle();
+  updateStatusLED();
   
   // Monitor PCM signals
   monitorPcmSignals();
@@ -1222,28 +1981,64 @@ void disableMotor() {
 // PCM SIGNAL MONITORING
 // ============================================
 
-void monitorPcmSignals() {
-  // Read current state (inverted due to optocoupler)
-  uint8_t currentState = 0;
-  currentState |= (!digitalRead(PIN_PCM_A1)) << 0;
-  currentState |= (!digitalRead(PIN_PCM_A2)) << 1;
-  currentState |= (!digitalRead(PIN_PCM_B1)) << 2;
-  currentState |= (!digitalRead(PIN_PCM_B2)) << 3;
+// ISR for PCM pin changes - called on ANY change to ANY PCM pin
+void IRAM_ATTR pcmPinChangeISR() {
+  // Read current state immediately (inverted due to optocoupler)
+  uint8_t newState = 0;
+  newState |= (!digitalRead(PIN_PCM_A1)) << 0;
+  newState |= (!digitalRead(PIN_PCM_A2)) << 1;
+  newState |= (!digitalRead(PIN_PCM_B1)) << 2;
+  newState |= (!digitalRead(PIN_PCM_B2)) << 3;
   
-  // Idle timeout
+  // Only log if state actually changed (debounce)
+  if (newState != currentPcmState) {
+    currentPcmState = newState;
+    
+    // Log to circular buffer
+    signalLog[logHead].timestamp = millis();
+    signalLog[logHead].pcmA1 = (newState >> 0) & 1;
+    signalLog[logHead].pcmA2 = (newState >> 1) & 1;
+    signalLog[logHead].pcmB1 = (newState >> 2) & 1;
+    signalLog[logHead].pcmB2 = (newState >> 3) & 1;
+    signalLog[logHead].iacActive = isMoving ? 1 : 0;
+    
+    // Advance head (circular)
+    logHead = (logHead + 1) % LOG_BUFFER_SIZE;
+    
+    // Track count and overflow
+    if (logCount < LOG_BUFFER_SIZE) {
+      logCount++;
+    } else {
+      logOverflow = true;
+      logTail = (logTail + 1) % LOG_BUFFER_SIZE;  // Overwrite oldest
+    }
+    
+    // Set flag for main loop processing
+    pcmStateChanged = true;
+    lastPcmChange = millis();
+  }
+}
+
+void monitorPcmSignals() {
+  // Idle timeout detection (run in main loop)
   if (millis() - lastPcmChange > PCM_IDLE_TIMEOUT) {
     pcmDirection = 0;
   }
   
-  // Check for change
-  if (currentState != prevPcmState) {
-    lastPcmChange = millis();
+  // Process state change flagged by ISR
+  if (pcmStateChanged) {
+    pcmStateChanged = false;
+    
+    // Get the most recent logged state for direction detection
+    int lastLogIdx = (logHead + LOG_BUFFER_SIZE - 1) % LOG_BUFFER_SIZE;
+    uint8_t currentState = (signalLog[lastLogIdx].pcmA1) |
+                          (signalLog[lastLogIdx].pcmA2 << 1) |
+                          (signalLog[lastLogIdx].pcmB1 << 2) |
+                          (signalLog[lastLogIdx].pcmB2 << 3);
     
     int8_t newStepIndex = STEP_LOOKUP[currentState];
     
-    // Debug: show PCM state changes
-    Serial.printf("PCM Change: pattern=%d stepIndex=%d (prev=%d) ", currentState, newStepIndex, pcmStepIndex);
-    
+    // Direction detection
     if (newStepIndex >= 0 && pcmStepIndex >= 0) {
       int8_t expectedFwd = (pcmStepIndex + 1) % 4;
       int8_t expectedRev = (pcmStepIndex + 3) % 4;
@@ -1251,31 +2046,13 @@ void monitorPcmSignals() {
       if (newStepIndex == expectedFwd) {
         pcmDirection = 1;
         pcmStepPosition++;
-        Serial.printf("-> FWD pos=%ld\n", pcmStepPosition);
       } else if (newStepIndex == expectedRev) {
         pcmDirection = -1;
         pcmStepPosition--;
-        Serial.printf("-> REV pos=%ld\n", pcmStepPosition);
-      } else {
-        Serial.printf("-> SKIP (expected %d or %d)\n", expectedFwd, expectedRev);
       }
-    } else {
-      Serial.println(newStepIndex < 0 ? "-> INVALID" : "-> INIT");
     }
     
     pcmStepIndex = newStepIndex;
-    
-    // Log the change
-    signalLog[logIndex].timestamp = millis();
-    signalLog[logIndex].pcmA1 = (currentState >> 0) & 1;
-    signalLog[logIndex].pcmA2 = (currentState >> 1) & 1;
-    signalLog[logIndex].pcmB1 = (currentState >> 2) & 1;
-    signalLog[logIndex].pcmB2 = (currentState >> 3) & 1;
-    signalLog[logIndex].iacActive = isMoving ? 1 : 0;
-    
-    logIndex = (logIndex + 1) % LOG_BUFFER_SIZE;
-    if (logCount < LOG_BUFFER_SIZE) logCount++;
-    
     prevPcmState = currentState;
   }
 }
